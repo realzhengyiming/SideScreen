@@ -6,10 +6,12 @@
 
 <h1>Side Screen</h1>
 
-<p><em>Turn your Android tablet into a second display for macOS — USB-C or wireless over WiFi</em></p>
+<p><em>Use an Android or HarmonyOS tablet as a second display for your Mac.</em></p>
+
+<p><a href="#harmonyos-usb">鸿蒙 7.0+ 平板给 Mac mini 当副屏 · USB 直连 · 平板免装 App</a></p>
 
 <p>
-  <img src="https://img.shields.io/github/v/release/tranvuongquocdat/SideScreen?style=for-the-badge&label=version&color=blue" alt="Version">
+  <img src="https://img.shields.io/github/v/release/tranvuongquocdat/SideScreen?style=for-the-badge&label=upstream%20release&color=blue" alt="Upstream release">
   <a href="https://github.com/tranvuongquocdat/SideScreen/blob/main/LICENSE">
     <img src="https://img.shields.io/github/license/tranvuongquocdat/SideScreen?style=for-the-badge&color=34C759" alt="License">
   </a>
@@ -31,13 +33,38 @@
 
 ---
 
+<a id="harmonyos-usb"></a>
+
+## 鸿蒙平板当 Mac mini 副屏
+
+本项目 fork 自 [tranvuongquocdat/SideScreen](https://github.com/tranvuongquocdat/SideScreen)，沿用原项目的 MIT 许可证。这个分支给 SideScreen 加上了 **HarmonyOS 7.0+ 的 USB 副屏模式**。Mac mini 创建扩展桌面，平板用系统浏览器显示。平板免装 App，画面走 USB 数据线。
+
+### 这个分支改了什么
+
+- **USB 连接**。原版安卓 USB 模式用 `adb reverse`。鸿蒙端用华为的 `hdc rport`，由 [Mac 上的转发脚本](HarmonyClient/bridge.py) 建立连接。
+- **平板播放**。新增[浏览器播放器](HarmonyClient/viewer.js)，接收 SideScreen 的视频流，支持全屏、断线重连和画质回退。用 Mac 的键盘和鼠标操作桌面。
+- **分辨率适配**。复用原版的虚拟显示器、画面捕获和编码，在 [Mac 端](MacHost/Sources/AppDelegate.swift) 增加平板尺寸协商。连接时读取平板的物理分辨率，创建 60 Hz HiDPI 桌面，并优先尝试按原生像素传输。例如 2800×1840 的面板会用 1400×920 的桌面缩放，让文字大小合适，同时保留像素细节。
+
+### 怎么用
+
+在 Mac 上准备 Python 3、Swift 构建工具和华为的 `hdc`。脚本会寻找 DevEco Studio 自带的 `hdc`，也可以通过 `SIDESCREEN_HDC` 指定可执行文件的完整路径。 [华为 hdc 使用说明](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/hdc/)
+
+1. 下载或克隆本仓库，在仓库目录运行 `./scripts/build_harmony_mac.sh`，构建带自动分辨率适配的 Mac 端。
+2. 用 USB 数据线连接平板。在平板开启「USB 调试」，并允许这台 Mac 连接。
+3. 如果原版 SideScreen 正在运行，先退出。双击仓库里的 [打开鸿蒙副屏.command](打开鸿蒙副屏.command)，保持终端窗口运行。首次使用时按 macOS 提示授权屏幕录制。
+4. 解锁平板，等浏览器打开副屏页面，再点「全屏」。也可以在平板浏览器手动输入 `http://127.0.0.1:54323/`。实际串流分辨率显示在「全屏」按钮下方。
+
+在 Mac 的「系统设置 → 显示器」中调整屏幕排列，就可以把窗口拖到平板上。已用 Mac mini 和 HarmonyOS 7.0 平板验证 USB 出画。
+
+---
+
 <div align="center">
   <img src="resources/screenshots/hero_screenshot.jpeg" alt="Side Screen — Mac + Android tablet as second display" width="800"/>
 </div>
 
 ---
 
-## About
+## About the upstream Android client
 
 Side Screen brings true second-display functionality to your Android tablet — over USB-C cable for the lowest latency, or wirelessly over WiFi after a one-time QR pair. Something macOS doesn't natively support either way.
 
@@ -51,7 +78,7 @@ For full details, features, and documentation, please visit **[sidescreen.dev](h
 
 ---
 
-## Features
+## Upstream features
 
 ### USB-C or Wireless
 
@@ -105,7 +132,7 @@ Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a la
 
 ---
 
-## Requirements
+## Android requirements
 
 | | macOS Host | Android Client |
 |---|---|---|
@@ -116,7 +143,7 @@ Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a la
 
 ---
 
-## Installation
+## Upstream installation
 
 - **Android**: [Get it on Google Play](https://play.google.com/store/apps/details?id=com.sidescreen.app) — updates install automatically.
 - **macOS**: Download the `.dmg` from [**GitHub Releases**](https://github.com/tranvuongquocdat/SideScreen/releases), open it, drag Side Screen to Applications. The app is signed and notarized by Apple, and checks for updates on its own. Port forwarding over USB is handled automatically by the Mac app.
@@ -152,28 +179,14 @@ cd AndroidClient && ./gradlew assembleDebug
 
 ## Usage
 
-### USB mode (default — lowest latency)
+### Android USB mode (default — lowest latency)
 
 1. Connect tablet to Mac via **USB-C**
 2. Launch **Side Screen** on Mac (runs in menu bar — port forwarding is set up automatically)
 3. Open **Side Screen** on tablet → keep on the **USB** tab → tap **Connect**
 4. Done — drag windows to your new display
 
-### 鸿蒙平板 USB 副屏
-
-已在 HarmonyOS 7.0 平板和 Mac 版 SideScreen 1.1.1 上实测。Mac 需有 Python 3 和华为的 `hdc`。可以使用 DevEco Studio 自带的 `hdc`，或通过环境变量 `SIDESCREEN_HDC` 指向其路径。[华为 hdc 使用说明](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/hdc/)
-
-1. 用 USB 数据线连接平板，开启「USB 调试」并允许此 Mac 连接。
-2. 在 Mac 上双击 `打开鸿蒙副屏.command`，并保持终端窗口运行。使用原版 SideScreen 时，在 **USB** 模式点 **Start**。首次使用时按 macOS 提示授权屏幕录制。
-3. 解锁平板，等浏览器自动打开画面，再点「全屏」。也可以在平板浏览器手动打开 `http://127.0.0.1:54323/`。
-
-高清模式需要先在 Mac 上运行 `./scripts/build_harmony_mac.sh`。如果原版 SideScreen 正在串流，先退出原版，再双击同一个启动脚本。脚本会启动本地的 SideScreen Harmony。
-
-高清模式会读取平板的物理分辨率，按屏幕比例创建 60 Hz HiDPI 扩展桌面。平板浏览器会尝试 HEVC 和 H.264，解码失败时切换到兼容画质。全屏按钮下方显示当前收到的画面尺寸。
-
-画面通过 USB 传输。用 Mac 的鼠标和键盘操作，在「系统设置 → 显示器」里排列屏幕。可以按 `Ctrl+C` 停止 USB 转发。
-
-### Wireless mode (new in 0.8.0 — no cable)
+### Android wireless mode (new in 0.8.0 — no cable)
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
 2. Open **Side Screen** on tablet → switch to the **Wireless** tab → tap **Scan QR Code** → grant camera permission → aim at the QR on the Mac
