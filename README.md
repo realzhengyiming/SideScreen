@@ -164,8 +164,12 @@ cd AndroidClient && ./gradlew assembleDebug
 已在 HarmonyOS 7.0 平板和 Mac 版 SideScreen 1.1.1 上实测。Mac 需有 Python 3 和华为的 `hdc`。可以使用 DevEco Studio 自带的 `hdc`，或通过环境变量 `SIDESCREEN_HDC` 指向其路径。[华为 hdc 使用说明](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/hdc/)
 
 1. 用 USB 数据线连接平板，开启「USB 调试」并允许此 Mac 连接。
-2. 在 Mac 上双击 `打开鸿蒙副屏.command`，并保持终端窗口运行。在 SideScreen 选择 **USB** 并点 **Start**。首次使用时按 macOS 提示授权屏幕录制。也可以在 SideScreen 的 **Startup** 设置中启用自动开始串流。
+2. 在 Mac 上双击 `打开鸿蒙副屏.command`，并保持终端窗口运行。使用原版 SideScreen 时，在 **USB** 模式点 **Start**。首次使用时按 macOS 提示授权屏幕录制。
 3. 解锁平板，等浏览器自动打开画面，再点「全屏」。也可以在平板浏览器手动打开 `http://127.0.0.1:54323/`。
+
+高清模式需要先在 Mac 上运行 `./scripts/build_harmony_mac.sh`。如果原版 SideScreen 正在串流，先退出原版，再双击同一个启动脚本。脚本会启动本地的 SideScreen Harmony。
+
+高清模式会读取平板的物理分辨率，按屏幕比例创建 60 Hz HiDPI 扩展桌面。平板浏览器会尝试 HEVC 和 H.264，解码失败时切换到兼容画质。全屏按钮下方显示当前收到的画面尺寸。
 
 画面通过 USB 传输。用 Mac 的鼠标和键盘操作，在「系统设置 → 显示器」里排列屏幕。可以按 `Ctrl+C` 停止 USB 转发。
 

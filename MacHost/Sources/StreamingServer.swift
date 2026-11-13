@@ -40,6 +40,9 @@ private enum WireMessage {
     /// BEFORE type 8, so the host knows which profile to apply before the
     /// display config goes out.
     static let clientIdentity: UInt8 = 18
+    /// Client→server, native panel width and height in the type-11 encoding.
+    /// USB clients send this before type 8 to match the virtual display to the panel.
+    static let clientDisplaySize: UInt8 = 19
 }
 
 private extension String {
@@ -188,8 +191,8 @@ class StreamingServer {
     /// UUID, or `name:<handshake name>` for wireless apps that predate it;
     /// nil for older USB apps). Return true to start streaming now. Return
     /// false to hold the startup while the owner rebuilds the display for
-    /// this tablet's profile, then call `resumeProtocolStartup()`.
-    var onPrepareForClient: ((_ key: String?, _ name: String) -> Bool)?
+    /// this tablet's profile or panel size, then call `resume`.
+    var onPrepareForClient: ((_ key: String?, _ name: String, _ display: TabletDisplayMode?, _ resume: @escaping () -> Void) -> Bool)?
 
     // Code pairing (issue #35): when non-nil, a pre-auth "SSPC" request
     // carrying this one-time code is answered with the real auth token, and
@@ -252,6 +255,7 @@ class StreamingServer {
     private(set) var clientDecodeLimitTable: [Int: (width: Int, height: Int)]?
     /// Set when the client opts in via type 12. Gates desktopGeometry sends.
     private var clientSupportsDesktopGeometry = false
+    private var clientDisplayMode: TabletDisplayMode?
     /// Type 18 identity of the connected client, if it sent one.
     private var clientIdentity: DeviceIdentity?
     /// Name from the wireless auth handshake (nil over USB).
@@ -369,6 +373,7 @@ class StreamingServer {
         clientDecodeLimits = nil
         clientDecodeLimitTable = nil
         clientSupportsDesktopGeometry = false
+        clientDisplayMode = nil
         clientIdentity = nil
         handshakeDeviceName = nil
         startupPrepared = false
@@ -378,17 +383,20 @@ class StreamingServer {
         connection = newConnection
         droppedFrames = 0
 
-        connection?.stateUpdateHandler = { [weak self] state in
+        connection?.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard let self, let newConnection, self.connection === newConnection else { return }
             debugLog("Connection state: \(state)")
             switch state {
             case .ready:
-                self?.onConnectionReady(newConnection)
+                self.onConnectionReady(newConnection)
             case .failed(let error):
                 debugLog("Connection failed: \(error)")
-                self?.onClientDisconnected?()
+                self.connectionReady = false
+                self.onClientDisconnected?()
             case .cancelled:
                 debugLog("Connection cancelled")
-                self?.onClientDisconnected?()
+                self.connectionReady = false
+                self.onClientDisconnected?()
             default:
                 break
             }
@@ -431,9 +439,13 @@ class StreamingServer {
             startupPrepared = true
             let key = clientIdentity?.id ?? DeviceProfileStore.fallbackKey(deviceName: handshakeDeviceName)
             let name = clientIdentity?.name.nilIfEmpty ?? handshakeDeviceName ?? ""
-            if !prepare(key, name) {
+            let requestedMode = conn.endpoint.isLoopback ? clientDisplayMode : nil
+            if !prepare(key, name, requestedMode, { [weak self, weak conn] in
+                guard let self, let conn else { return }
+                self.resumeProtocolStartup(for: conn)
+            }) {
                 startupHeld = true
-                debugLog("Startup held — applying this tablet's profile first")
+                debugLog("Startup held — preparing tablet display")
                 return
             }
         }
@@ -688,11 +700,12 @@ class StreamingServer {
         }
 
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
-            guard let self = self, self.isReceiving, !self.isStopped else { return }
+            guard let self, self.connection === connection, self.isReceiving, !self.isStopped else { return }
 
             if error != nil || isComplete {
                 self.isReceiving = false
                 self.inputBuffer.removeAll(keepingCapacity: true)
+                connection.cancel()
                 return
             }
 
@@ -787,8 +800,7 @@ class StreamingServer {
                     debugLog("Malformed decoder-limits payload — ignoring")
                     continue
                 }
-                let w = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
-                let h = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
+                let (w, h) = decodeSize(payload[...])
                 // Anything below QVGA-ish is a nonsense report — ignore it.
                 if w >= 256 && h >= 256 {
                     clientDecodeLimits = (w, h)
@@ -823,8 +835,8 @@ class StreamingServer {
                 }
                 var table: [Int: (width: Int, height: Int)] = [:]
                 for (i, fps) in CodecLimits.tableFps.enumerated() {
-                    let w = (Int(payload[4 * i] & 0x7F) << 7) | Int(payload[4 * i + 1] & 0x7F)
-                    let h = (Int(payload[4 * i + 2] & 0x7F) << 7) | Int(payload[4 * i + 3] & 0x7F)
+                    let start = 4 * i
+                    let (w, h) = decodeSize(payload[start..<(start + 4)])
                     // Anything below QVGA-ish is a nonsense report — drop the whole table.
                     guard w >= 256, h >= 256 else {
                         table.removeAll()
@@ -891,6 +903,14 @@ class StreamingServer {
                     }
                 }
 
+            case WireMessage.clientDisplaySize:
+                guard inputBuffer.count >= 5 else { return }
+                let payload = (1...4).map { inputByte(at: $0) }
+                consumeInputBytes(5)
+                guard !startupPrepared, payload.allSatisfy({ $0 & 0x80 != 0 }) else { continue }
+                let (width, height) = decodeSize(payload[...])
+                clientDisplayMode = TabletDisplayMode(width: width, height: height)
+
             default:
                 debugLog("Unknown client input type: \(msgType)")
                 consumeInputBytes(1)
@@ -898,11 +918,16 @@ class StreamingServer {
         }
     }
 
-    /// Finish a startup that onPrepareForClient held. Safe to call from any
-    /// thread, and a no-op if that client has gone in the meantime.
-    func resumeProtocolStartup() {
-        networkQueue.async { [weak self] in
-            guard let self = self, self.startupHeld, let conn = self.connection else { return }
+    private func decodeSize(_ bytes: ArraySlice<UInt8>) -> (width: Int, height: Int) {
+        let i = bytes.startIndex
+        let width = (Int(bytes[i] & 0x7F) << 7) | Int(bytes[i + 1] & 0x7F)
+        let height = (Int(bytes[i + 2] & 0x7F) << 7) | Int(bytes[i + 3] & 0x7F)
+        return (width, height)
+    }
+
+    private func resumeProtocolStartup(for conn: NWConnection) {
+        networkQueue.async { [weak self, weak conn] in
+            guard let self, let conn, self.connection === conn, self.startupHeld else { return }
             self.startupHeld = false
             self.finishProtocolStartup(on: conn)
         }

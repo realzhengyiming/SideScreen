@@ -12,6 +12,29 @@ enum StreamCodec {
     }
 }
 
+/// Native panel size requested by the USB viewer. Render at 2× so the
+/// desktop has readable UI while the stream can use every panel pixel.
+struct TabletDisplayMode: Equatable {
+    let width: Int
+    let height: Int
+    static let refreshRate = 60
+
+    init?(width: Int, height: Int) {
+        guard min(width, height) >= 480,
+              min(width, height) <= 4320,
+              max(width, height) <= 7680 else { return nil }
+        self.width = width & ~1
+        self.height = height & ~1
+    }
+
+    func desktopSize(rotation: Int) -> (width: Int, height: Int) {
+        if rotation == 90 || rotation == 270 {
+            return (height / 2, width / 2)
+        }
+        return (width / 2, height / 2)
+    }
+}
+
 enum CodecLimits {
     /// Conservative floor every AVC hardware decoder meets (H.264 level 4.x).
     /// AVC-only devices are low-end; their real cap is at or above this.

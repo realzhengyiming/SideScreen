@@ -5,6 +5,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import signal
@@ -12,14 +13,42 @@ import socket
 import subprocess
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 
 
 HERE = Path(__file__).resolve().parent
 LOOPBACK = "127.0.0.1"
 DEFAULT_MAC_PORT = 54321
 DEFAULT_VIEWER_PORT = 54323
-# Ask the host for H.264 before opting in to frames with timing metadata.
-STREAM_CAPABILITIES = bytes((9, 8))
+MAC_APP = HERE.parent / "MacHost/.build/SideScreen Harmony.app"
+
+
+def pixel_size(width, height):
+    width, height = int(width), int(height)
+    if not (480 <= min(width, height) <= 4320 and max(width, height) <= 7680):
+        raise ValueError("invalid panel size")
+    return width & ~1, height & ~1
+
+
+def encode_size(size):
+    return bytes(0x80 | (side >> shift) & 0x7F for side in size for shift in (7, 0))
+
+
+def stream_capabilities(query, panel):
+    params = parse_qs(query)
+    codec = params.get("codec", ["avc"])[0]
+    if codec not in ("avc", "hevc"):
+        raise ValueError("invalid codec")
+    hello = bytearray((9,)) if codec == "avc" else bytearray()
+    if panel is None and "w" in params and "h" in params:
+        panel = pixel_size(params["w"][0], params["h"][0])
+    if panel is not None:
+        target = tuple(sorted(panel, reverse=True))
+        # A 60 Hz decoding budget, advertised independently of the panel size.
+        limit = tuple(max(256, side // 2) for side in target) if "compat" in params else target
+        hello.extend((11, *encode_size(limit), 19, *encode_size(target)))
+    hello.append(8)
+    return hello
 
 
 def find_hdc():
@@ -42,9 +71,10 @@ def find_hdc():
 
 
 def mac_port():
+    domain = "com.sidescreen.harmony" if MAC_APP.is_dir() else "com.sidescreen.app"
     try:
         value = subprocess.check_output(
-            ["defaults", "read", "com.sidescreen.app", "SideScreen_port"],
+            ["defaults", "read", domain, "SideScreen_port"],
             stderr=subprocess.DEVNULL, text=True, timeout=2,
         )
         return port_number(value)
@@ -99,6 +129,17 @@ class UsbTunnel:
             raise RuntimeError(f"USB 转发失败。{output.strip()}")
         self.owned_targets.add(target)
 
+    def panel_size(self, target):
+        # The browser's CSS pixels can be scaled by system display settings.
+        output = self.run("-t", target, "shell", "hidumper -s RenderService -a screen")
+        match = re.search(r"physical resolution=(\d+)x(\d+), isVirtual=false", output)
+        if match:
+            try:
+                return pixel_size(*match.groups())
+            except ValueError:
+                pass
+        return None
+
     def open_viewer(self, target):
         output = self.run("-t", target, "shell", "aa", "start", "-A", "ohos.want.action.viewData", "-U", self.url)
         if "start ability successfully" in output:
@@ -120,6 +161,7 @@ class ViewerServer(ThreadingHTTPServer):
         super().__init__((LOOPBACK, viewer_port), ViewerHandler)
         self.source_port = source_port
         self.stream_lock = threading.Lock()
+        self.panel_size = None
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
@@ -128,11 +170,17 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if self.headers.get("Host") != expected_host or self.headers.get("Sec-Fetch-Site") == "cross-site":
             self.send_error(403)
             return
-        if self.path == "/stream":
-            self.serve_stream()
+        path = urlsplit(self.path)
+        if path.path == "/stream":
+            try:
+                hello = stream_capabilities(path.query, self.server.panel_size)
+            except ValueError:
+                self.send_error(400, "Invalid stream parameters")
+                return
+            self.serve_stream(hello)
             return
         if self.path == "/":
-            self.serve_file("index.html", "text/html; charset=utf-8")
+            self.serve_page()
         elif self.path == "/viewer.js":
             self.serve_file("viewer.js", "text/javascript; charset=utf-8")
         elif self.path == "/favicon.ico":
@@ -156,19 +204,27 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.headers_for(content_type, len(data))
         self.wfile.write(data)
 
-    def serve_stream(self):
+    def serve_page(self):
+        data = (HERE / "index.html").read_bytes()
+        if self.server.panel_size:
+            width, height = sorted(self.server.panel_size, reverse=True)
+            data = data.replace(b"<main>", f'<main data-width="{width}" data-height="{height}">'.encode("ascii"))
+        self.headers_for("text/html; charset=utf-8", len(data))
+        self.wfile.write(data)
+
+    def serve_stream(self, hello):
         if not self.server.stream_lock.acquire(blocking=False):
             self.send_error(409, "Another viewer is already connected")
             return
         try:
+            self.connection.settimeout(5)
             try:
                 source = socket.create_connection((LOOPBACK, self.server.source_port), timeout=2)
             except OSError:
                 self.send_error(503, "Start USB streaming in SideScreen on the Mac")
                 return
             with source:
-                self.connection.settimeout(5)
-                source.sendall(STREAM_CAPABILITIES)
+                source.sendall(hello)
                 self.headers_for("application/octet-stream")
                 while True:
                     ready, _, _ = select.select([source, self.connection], [], [])
@@ -193,6 +249,7 @@ def main():
     parser.add_argument("--mac-port", type=port_number, default=mac_port(), help="Mac SideScreen 的串流端口")
     parser.add_argument("--device", help="多台设备时的 USB 设备标识，可用 hdc list targets -v 查看")
     parser.add_argument("--no-open", action="store_true", help="由你在平板上手动打开浏览器")
+    parser.add_argument("--no-start-mac", action="store_true", help="连接已经运行的 Mac 串流服务")
     args = parser.parse_args()
     hdc = find_hdc()
     if hdc is None:
@@ -208,20 +265,34 @@ def main():
     print(f"Mac 上的 SideScreen 需在 USB 模式开始串流，端口为 {args.mac_port}。", flush=True)
     previous_status = None
     should_open = not args.no_open
+    last_target = None
 
     def stop(_signal, _frame):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
+    mac_process = None
     try:
+        if not args.no_start_mac:
+            if MAC_APP.is_dir():
+                mac_process = subprocess.Popen([
+                    MAC_APP / "Contents/MacOS/SideScreen", "--harmony-usb", "-SideScreen_port", str(args.mac_port),
+                ])
+            else:
+                subprocess.run(["/usr/bin/open", "-g", "-b", "com.sidescreen.app"], check=False)
         while True:
             try:
                 target = tunnel.target()
+                if target != last_target:
+                    server.panel_size = tunnel.panel_size(target) if target else None
+                    last_target = target
                 if target is None:
                     status = "等待鸿蒙平板连接，请插入数据线并在平板允许 USB 调试。"
                 else:
                     tunnel.ensure(target)
-                    status = f"USB 已连接，平板浏览器地址为 {tunnel.url}"
+                    size = server.panel_size
+                    panel = f"（{max(size)}×{min(size)}）" if size else ""
+                    status = f"USB 已连接{panel}，平板浏览器地址为 {tunnel.url}"
                     if should_open:
                         tunnel.open_viewer(target)
                         should_open = False
@@ -237,6 +308,13 @@ def main():
         tunnel.close()
         server.shutdown()
         server.server_close()
+        if mac_process and mac_process.poll() is None:
+            mac_process.terminate()
+            try:
+                mac_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                mac_process.kill()
+                mac_process.wait()
 
 
 if __name__ == "__main__":

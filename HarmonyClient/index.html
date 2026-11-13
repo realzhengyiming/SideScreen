@@ -20,6 +20,7 @@
       position: absolute; top: 12px; right: 12px; padding: 8px 14px; border: 1px solid #555;
       border-radius: 9px; background: #202020; color: #fff; font: inherit; cursor: pointer;
     }
+    button small:not([hidden]) { display: block; margin-top: 2px; font-size: 11px; color: #ccc; }
     :fullscreen button { display: none; }
   </style>
   <script type="module" src="/viewer.js"></script>
@@ -27,7 +28,7 @@
 <body>
   <main>
     <canvas aria-label="Mac 扩展桌面"></canvas>
-    <button id="fullscreen" type="button">全屏</button>
+    <button id="fullscreen" type="button" aria-label="全屏">全屏<small id="resolution" hidden></small></button>
     <p id="status" role="status">正在连接 Mac…</p>
   </main>
 </body>

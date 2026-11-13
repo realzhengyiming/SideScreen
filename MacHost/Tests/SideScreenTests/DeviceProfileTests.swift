@@ -148,9 +148,11 @@ final class StreamingServerProfileHoldTests: XCTestCase {
         let asked = expectation(description: "prepare asked")
         var seenKey: String?
         var seenName: String?
-        server.onPrepareForClient = { key, name in
+        var resumeStartup: (() -> Void)?
+        server.onPrepareForClient = { key, name, _, resume in
             seenKey = key
             seenName = name
+            resumeStartup = resume
             asked.fulfill()
             return false
         }
@@ -172,7 +174,7 @@ final class StreamingServerProfileHoldTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertNil(first.byte, "no display config while the profile is being applied")
 
-        server.resumeProtocolStartup()
+        try XCTUnwrap(resumeStartup)()
         await fulfillment(of: [first.arrived], timeout: 2)
         XCTAssertEqual(first.byte, 1, "display config once resumed")
     }
@@ -182,8 +184,9 @@ final class StreamingServerProfileHoldTests: XCTestCase {
         defer { server.stop() }
         let asked = expectation(description: "prepare asked")
         var seenKey: String? = "unset"
-        server.onPrepareForClient = { key, _ in
+        server.onPrepareForClient = { key, _, mode, _ in
             seenKey = key
+            XCTAssertNil(mode)
             asked.fulfill()
             return true
         }
@@ -196,6 +199,28 @@ final class StreamingServerProfileHoldTests: XCTestCase {
 
         await fulfillment(of: [asked, first.arrived], timeout: 2)
         XCTAssertNil(seenKey)
+        XCTAssertEqual(first.byte, 1)
+    }
+
+    func testUSBPanelSizeIsReadyBeforeStreamStarts() async throws {
+        let server = StreamingServer(port: 0)
+        defer { server.stop() }
+        let asked = expectation(description: "received panel size")
+        let panel = try XCTUnwrap(TabletDisplayMode(width: 2800, height: 1840))
+        server.onPrepareForClient = { _, _, mode, _ in
+            XCTAssertEqual(mode, panel)
+            asked.fulfill()
+            return true
+        }
+        try await server.start()
+
+        let conn = try await connect(to: server)
+        defer { conn.cancel() }
+        let first = FirstByte(from: conn, self)
+        // Type 19, 2800×1840 encoded in four seven-bit chunks, then type 8.
+        conn.send(content: Data([19, 149, 240, 142, 176, 8]), completion: .contentProcessed { _ in })
+
+        await fulfillment(of: [asked, first.arrived], timeout: 2)
         XCTAssertEqual(first.byte, 1)
     }
 }

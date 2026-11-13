@@ -2,6 +2,7 @@ const DISPLAY_CONFIG = 1;
 const VIDEO_FRAME = 6;
 const CODEC_SELECTED = 10;
 const H264 = 1;
+const HEVC_MAIN = 'hev1.1.6.L153.B0';
 const MAX_FRAME_SIZE = 32 * 1024 * 1024;
 const MAX_DECODE_QUEUE = 8;
 
@@ -60,6 +61,7 @@ const canvas = document.querySelector('canvas');
 const context = canvas.getContext('2d', { alpha: false, desynchronized: true });
 const status = document.getElementById('status');
 const fullscreen = document.getElementById('fullscreen');
+const resolution = document.getElementById('resolution');
 let flipX = 1;
 let flipY = 1;
 
@@ -84,19 +86,39 @@ new ResizeObserver(fitCanvas).observe(stage);
 
 class UnsupportedCodecError extends Error {}
 
-async function showStream() {
+function decoderConfig(codec, width, height) {
+  return { codec, codedWidth: width, codedHeight: height, optimizeForLatency: true };
+}
+
+function screenPixels() {
+  const { width, height } = stage.dataset;
+  if (width && height) return [Number(width), Number(height)];
+  return [screen.width, screen.height].map((size) => Math.round(size * devicePixelRatio));
+}
+
+async function prefersHevc(width, height) {
+  try {
+    const { supported } = await VideoDecoder.isConfigSupported(decoderConfig(HEVC_MAIN, width, height));
+    return supported;
+  } catch {
+    return false;
+  }
+}
+
+async function showStream(mode) {
   const connection = new AbortController();
   let decoder;
   let decoderError;
   let pendingFrame;
   let drawRequest;
-  let codecSelected = false;
+  let avc = false;
   let width = 0;
   let height = 0;
   let firstTimestamp;
   let lastTimestamp = -1;
   let needKeyframe = true;
   let wakeLock;
+  let firstFrameTimer;
 
   function stopWhenHidden() {
     if (document.hidden) connection.abort();
@@ -118,8 +140,11 @@ async function showStream() {
       try {
         context.drawImage(latest, 0, 0, canvas.width, canvas.height);
         if (!status.hidden) {
+          clearTimeout(firstFrameTimer);
           showStatus('');
-          wakeLock = navigator.wakeLock?.request('screen').catch(() => undefined);
+          resolution.textContent = `${canvas.width}×${canvas.height}`;
+          resolution.hidden = false;
+          wakeLock ??= navigator.wakeLock?.request('screen').catch(() => undefined);
         }
       } finally {
         latest.close();
@@ -129,8 +154,11 @@ async function showStream() {
 
   document.addEventListener('visibilitychange', stopWhenHidden);
   try {
-    const response = await fetch('/stream', { signal: connection.signal });
-    if (response.status === 503) throw new Error('请在 Mac 的 SideScreen 选择 USB 并点 Start。');
+    const [screenWidth, screenHeight] = screenPixels();
+    const params = new URLSearchParams({ w: screenWidth, h: screenHeight, codec: mode.codec });
+    if (mode.compat) params.set('compat', '1');
+    const response = await fetch(`/stream?${params}`, { signal: connection.signal });
+    if (response.status === 503) throw new Error('正在等待 Mac 串流。请确认 SideScreen 已在 USB 模式启动。');
     if (response.status === 409) throw new Error('已有副屏页面在播放，请关闭另一标签页。');
     if (!response.ok || !response.body) throw new Error('USB 连接暂时不可用，正在重试…');
     const stream = new StreamReader(response.body);
@@ -141,7 +169,7 @@ async function showStream() {
       if (message === CODEC_SELECTED) {
         const [codec] = await stream.read(1);
         if (codec !== H264) throw new Error('请使用支持 H.264 的 SideScreen Mac 版。');
-        codecSelected = true;
+        avc = true;
         continue;
       }
 
@@ -160,6 +188,10 @@ async function showStream() {
           height = newHeight;
           canvas.width = width;
           canvas.height = height;
+          resolution.hidden = true;
+          showStatus('正在调整画面…');
+          clearTimeout(firstFrameTimer);
+          firstFrameTimer = undefined;
           closeDecoder();
           needKeyframe = true;
         }
@@ -167,7 +199,7 @@ async function showStream() {
         continue;
       }
 
-      if (message !== VIDEO_FRAME || !codecSelected || !width) {
+      if (message !== VIDEO_FRAME || (mode.codec === 'avc' && !avc) || !width) {
         throw new Error('串流协议不匹配，请使用 SideScreen Mac 1.1.1 或更新版本。');
       }
       const header = view(await stream.read(13));
@@ -183,14 +215,9 @@ async function showStream() {
       }
       if (needKeyframe) {
         if (!keyframe) continue;
-        const config = {
-          codec: codecFromKeyframe(bytes),
-          codedWidth: width,
-          codedHeight: height,
-          optimizeForLatency: true,
-        };
+        const config = decoderConfig(avc ? codecFromKeyframe(bytes) : HEVC_MAIN, width, height);
         const { supported } = await VideoDecoder.isConfigSupported(config);
-        if (!supported) throw new UnsupportedCodecError('当前平板浏览器不支持这路 H.264 解码。');
+        if (!supported) throw new UnsupportedCodecError('平板浏览器无法解码这档画质。');
         decoder = new VideoDecoder({
           output: draw,
           error: (error) => {
@@ -200,6 +227,12 @@ async function showStream() {
         });
         decoder.configure(config);
         needKeyframe = false;
+        if (!firstFrameTimer && !status.hidden) {
+          firstFrameTimer = setTimeout(() => {
+            decoderError = new Error('等待首帧超时');
+            connection.abort();
+          }, 7000);
+        }
       }
 
       firstTimestamp ??= captureTime;
@@ -209,9 +242,10 @@ async function showStream() {
       }));
     }
   } catch (error) {
-    if (decoderError) throw new Error(`平板视频解码中断，正在重试。${decoderError.message}`);
+    if (decoderError) throw new UnsupportedCodecError(`平板视频解码中断。${decoderError.message}`);
     throw error;
   } finally {
+    clearTimeout(firstFrameTimer);
     connection.abort();
     document.removeEventListener('visibilitychange', stopWhenHidden);
     closeDecoder();
@@ -226,16 +260,28 @@ async function run() {
     showStatus('此浏览器缺少实时视频解码功能，请使用鸿蒙系统浏览器打开。');
     return;
   }
+  const [width, height] = screenPixels().sort((a, b) => b - a);
+  const modes = [
+    { codec: 'avc', compat: false },
+    { codec: 'avc', compat: true },
+  ];
+  if (await prefersHevc(width, height)) modes.unshift({ codec: 'hevc', compat: false });
+  let currentMode = 0;
   while (true) {
     if (document.hidden) {
       await new Promise((resolve) => document.addEventListener('visibilitychange', resolve, { once: true }));
       continue;
     }
     try {
-      await showStream();
+      await showStream(modes[currentMode]);
     } catch (error) {
-      showStatus(error instanceof TypeError ? 'USB 连接暂时不可用，正在重试…' : error.message);
-      if (error instanceof UnsupportedCodecError) return;
+      if (error instanceof UnsupportedCodecError && currentMode + 1 < modes.length) {
+        currentMode += 1;
+        showStatus('正在切换到兼容画质…');
+      } else {
+        showStatus(error instanceof TypeError ? 'USB 连接暂时不可用，正在重试…' : error.message);
+        if (error instanceof UnsupportedCodecError) return;
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }

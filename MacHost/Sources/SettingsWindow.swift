@@ -216,6 +216,10 @@ struct SettingsView: View {
                         // Display Configuration
                         FrostedGroupBox(title: "Display Configuration", icon: "display") {
                             VStack(alignment: .leading, spacing: 16) {
+                                if let mode = settings.tabletDisplayMode {
+                                    Text("Automatic tablet display · \(mode.width) × \(mode.height) · \(TabletDisplayMode.refreshRate) Hz · HiDPI")
+                                        .font(.system(size: 12, weight: .medium))
+                                }
                                 // Resolution
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
@@ -322,6 +326,7 @@ struct SettingsView: View {
                                         }
                                     }
                                 }
+                                .disabled(settings.tabletDisplayMode != nil)
 
                                 // HiDPI (Retina)
                                 HStack {
@@ -380,6 +385,7 @@ struct SettingsView: View {
                                                 Spacer()
                                             }
                                         }
+                                        .disabled(settings.tabletDisplayMode != nil)
                                     }
 
                                     if settings.rotation == 90 || settings.rotation == 270 {
@@ -500,6 +506,8 @@ struct SettingsView: View {
                                 }
                             }
                         }
+
+                        .disabled(settings.tabletDisplayMode != nil)
 
                         // Touch Control
                         FrostedGroupBox(title: "Touch Control", icon: "hand.tap") {
@@ -681,6 +689,8 @@ struct SettingsView: View {
                             }
                         }
 
+                        .disabled(settings.tabletDisplayMode != nil)
+
                         // Streaming Settings
                         FrostedGroupBox(title: "Streaming Settings", icon: "antenna.radiowaves.left.and.right") {
                             VStack(alignment: .leading, spacing: 16) {
@@ -765,6 +775,7 @@ struct SettingsView: View {
                                     }
                                 }
                             }
+                            .disabled(settings.tabletDisplayMode != nil)
                         }
 
                         // Status
@@ -1346,6 +1357,7 @@ class DisplaySettings: ObservableObject {
     // Runtime state (not persisted)
     @Published var displayCreated = false
     @Published var clientConnected = false
+    @Published var tabletDisplayMode: TabletDisplayMode?
     /// Device name of the wireless client currently streaming (nil when none).
     /// WirelessSection reads this to show a "Connected" badge on the matching row.
     @Published var currentWirelessDevice: String?

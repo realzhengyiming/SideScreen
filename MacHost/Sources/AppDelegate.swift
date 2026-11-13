@@ -57,6 +57,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Profile key of the tablet currently streaming (nil when none, or when
     /// it is an older USB app that does not identify itself).
     private var activeProfileKey: String?
+    private var tabletDisplayMode: TabletDisplayMode? { settings.tabletDisplayMode }
+    private var clientPreparation: Task<Void, Never>?
+    private var streamRefreshRate: Int {
+        tabletDisplayMode == nil ? settings.effectiveRefreshRate : TabletDisplayMode.refreshRate
+    }
     /// True while prepareProfile copies a profile into `settings` and rebuilds
     /// the display: the observers that would restart the server or push a
     /// display config early stand down, the switch does that work itself.
@@ -120,8 +125,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Declarative auto-start (no Mac interaction): start the server in the
         // chosen Startup mode if enabled. No blocking permission modal here —
         // it cannot be acted on when the Mac is headless.
-        if settings.autoStartStreamingOnLaunch {
-            settings.connectionMode = settings.startupMode
+        let harmonyUSB = ProcessInfo.processInfo.arguments.contains("--harmony-usb")
+        if harmonyUSB || settings.autoStartStreamingOnLaunch {
+            let mode: ConnectionMode = harmonyUSB ? .usb : settings.startupMode
+            if settings.connectionMode != mode { settings.connectionMode = mode }
             Task {
                 await self.checkPermissions()
                 if self.settings.hasScreenRecordingPermission {
@@ -226,7 +233,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.$gamingBoost
             .dropFirst() // Skip initial value
             .sink { [weak self] gamingBoost in
-                guard let self = self, self.settings.isRunning else { return }
+                guard let self = self, self.settings.isRunning, self.tabletDisplayMode == nil else { return }
                 print("🎮 Gaming Boost \(gamingBoost ? "ENABLED" : "DISABLED")")
                 self.screenCapture?.updateEncoderSettings(
                     bitrateMbps: self.settings.effectiveBitrate,
@@ -240,7 +247,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Publishers.CombineLatest(settings.$bitrate, settings.$quality)
             .dropFirst()
             .sink { [weak self] bitrate, quality in
-                guard let self = self, self.settings.isRunning, !self.settings.gamingBoost else { return }
+                guard let self = self, self.settings.isRunning, self.tabletDisplayMode == nil, !self.settings.gamingBoost else { return }
                 print("⚙️ Settings updated: \(bitrate)Mbps, \(quality)")
                 self.screenCapture?.updateEncoderSettings(
                     bitrateMbps: bitrate,
@@ -306,7 +313,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in
                 guard let self = self else { return }
                 Task { @MainActor in
-                    let effective = self.settings.effectiveRefreshRate
+                    let effective = self.streamRefreshRate
                     guard effective != self.lastAppliedRefreshRate else { return }
                     self.restartRunningServer(reason: "Refresh rate changed to \(effective) Hz")
                 }
@@ -328,7 +335,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// pipeline. No-op while stopped.
     private func restartRunningServer(reason: String) {
         Task { @MainActor in
-            guard self.settings.isRunning else { return }
+            guard self.settings.isRunning, self.tabletDisplayMode == nil else { return }
             debugLog("\(reason) — restarting server to rebuild virtual display")
             self.stopServer()
             await self.startServer()
@@ -594,7 +601,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             screenCapture = try await makeCapture(for: manager)
 
             // Setup server
-            streamingServer = StreamingServer(port: settings.port)
+            let server = StreamingServer(port: settings.port)
+            streamingServer = server
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
@@ -609,9 +617,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             configureDisplayGeometry(on: streamingServer, for: manager)
-            streamingServer?.onPrepareForClient = { [weak self] key, name in
-                guard let self = self, let key = key else { return true }
-                Task { @MainActor in await self.prepareProfile(key: key, name: name) }
+            server.onPrepareForClient = { [weak self, weak server] key, name, mode, resume in
+                guard let self, let server else { return true }
+                Task { @MainActor in
+                    let previous = self.clientPreparation
+                    self.clientPreparation = Task { @MainActor in
+                        await previous?.value
+                        guard self.streamingServer === server else { return }
+                        await self.prepareClient(key: key, name: name, mode: mode, for: server)
+                        resume()
+                    }
+                }
                 return false
             }
             streamingServer?.onClientConnected = { [weak self] in
@@ -635,7 +651,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Whatever the codec negotiation settled on, this is what the
                 // stream's SPS will carry, so it is what the client must size
                 // its decoder for.
-                let desktop = self.settings.resolutionSize
+                let desktop = self.desktopSize
                 self.streamingServer?.setDesktopSize(width: desktop.width, height: desktop.height)
                 self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
             }
@@ -671,13 +687,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            guard let server = streamingServer else {
-                throw NSError(
-                    domain: "SideScreen.Startup",
-                    code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: "The streaming server could not be created."]
-                )
-            }
             try await server.start()
             startStreaming(to: server)
 
@@ -702,12 +711,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Create the virtual display from the current settings, in extend mode.
     private func createVirtualDisplay(on manager: VirtualDisplayManager) throws {
-        let size = settings.resolutionSize
+        let size = desktopSize
         try manager.createDisplay(
             width: size.width,
             height: size.height,
-            refreshRate: settings.refreshRate,
-            hiDPI: settings.hiDPI,
+            refreshRate: tabletDisplayMode == nil ? settings.refreshRate : streamRefreshRate,
+            hiDPI: tabletDisplayMode != nil || settings.hiDPI,
             name: "SideScreen"
         )
 
@@ -717,6 +726,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             // Not critical - continue anyway
         }
+    }
+
+    private var desktopSize: (width: Int, height: Int) {
+        tabletDisplayMode?.desktopSize(rotation: settings.rotation) ?? settings.resolutionSize
     }
 
     /// Capture for `manager`'s display, already positioned.
@@ -741,8 +754,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.settings.captureMethod = method
             }
         }
-        lastAppliedRefreshRate = settings.effectiveRefreshRate
-        try await capture.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+        lastAppliedRefreshRate = streamRefreshRate
+        try await capture.setupForVirtualDisplay(displayID, refreshRate: streamRefreshRate)
         return capture
     }
 
@@ -752,23 +765,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // selects its decoder from it, so a friendlier number here makes it
         // check capabilities against a resolution it will never receive. The
         // logical desktop travels separately, for display only.
-        let size = settings.resolutionSize
+        let size = desktopSize
         let initialEncode = ScreenCapture.physicalSize(for: displayID)
         server?.setDesktopSize(width: size.width, height: size.height)
         server?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
     }
 
     private func startStreaming(to server: StreamingServer) {
+        let adaptive = tabletDisplayMode != nil
         screenCapture?.startStreaming(
             to: server,
-            bitrateMbps: settings.effectiveBitrate,
-            quality: settings.effectiveQuality,
-            gamingBoost: settings.gamingBoost,
-            frameRate: settings.effectiveRefreshRate
+            bitrateMbps: adaptive ? 80 : settings.effectiveBitrate,
+            quality: adaptive ? "high" : settings.effectiveQuality,
+            gamingBoost: !adaptive && settings.gamingBoost,
+            frameRate: streamRefreshRate
         )
     }
 
     // MARK: - Per-tablet profiles
+
+    @MainActor
+    private func prepareClient(key: String?, name: String, mode: TabletDisplayMode?, for server: StreamingServer) async {
+        let modeChanged = tabletDisplayMode != mode
+        if mode != nil {
+            closeActiveProfile()
+        }
+        if modeChanged { settings.tabletDisplayMode = mode }
+
+        do {
+            if mode == nil, let key {
+                try await prepareProfile(key: key, name: name, rebuild: modeChanged, for: server)
+            } else if modeChanged {
+                virtualDisplayManager?.saveDisplayPosition()
+                try await rebuildDisplay(for: server)
+            }
+        } catch {
+            guard streamingServer === server else { return }
+            debugLog("Display change failed: \(error)")
+            if mode != nil {
+                settings.tabletDisplayMode = nil
+                do {
+                    try await rebuildDisplay(for: server)
+                    return
+                } catch {
+                    debugLog("Display recovery failed: \(error)")
+                }
+            }
+            if streamingServer === server { stopServer() }
+        }
+    }
 
     /// A tablet identified itself and its stream is held until this returns
     /// it to the server. Its profile is applied first: nothing to do when it
@@ -778,10 +823,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// without a profile starts from the current settings, i.e. the last
     /// profile used.
     @MainActor
-    private func prepareProfile(key: String, name: String) async {
-        guard let server = streamingServer else { return }
-        defer { server.resumeProtocolStartup() }
-
+    private func prepareProfile(key: String, name: String, rebuild: Bool, for server: StreamingServer) async throws {
         // Flush whatever the current settings belong to (the last tablet, or
         // one that never disconnected cleanly) before they are replaced.
         virtualDisplayManager?.saveDisplayPosition()
@@ -795,6 +837,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let target = stored?.settings, target != current else {
             debugLog("Profile \(displayName): \(stored == nil ? "new tablet, starting from the last profile" : "matches, nothing to apply")")
+            if rebuild { try await rebuildDisplay(for: server) }
             return
         }
 
@@ -802,15 +845,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         defer { isSwitchingProfile = false }
         settings.apply(target)
 
-        if target.displayShape != current.displayShape {
+        if rebuild || target.displayShape != current.displayShape {
             debugLog("Profile \(displayName): rebuilding display for \(target.resolution) @ \(target.refreshRate)Hz")
-            lastAppliedRefreshRate = settings.effectiveRefreshRate
-            do {
-                try await rebuildDisplay(for: server)
-            } catch {
-                debugLog("❌ Profile switch failed: \(error) — stopping server")
-                stopServer()
-            }
+            lastAppliedRefreshRate = streamRefreshRate
+            try await rebuildDisplay(for: server)
         } else {
             debugLog("Profile \(displayName): applied live")
             if target.positionX != current.positionX || target.positionY != current.positionY {
@@ -829,6 +867,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         try createVirtualDisplay(on: manager)
         try? await Task.sleep(nanoseconds: 500_000_000)
+        guard streamingServer === server else { return }
         manager.restoreDisplayPosition()
         let capture = try await makeCapture(for: manager)
         guard streamingServer === server else { return }
@@ -903,6 +942,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         screenCapture = nil
         streamingServer = nil
         virtualDisplayManager = nil
+        settings.tabletDisplayMode = nil
+        clientPreparation = nil
         currentWirelessDevice = nil
 
         settings.isRunning = false
