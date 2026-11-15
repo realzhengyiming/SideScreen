@@ -62,6 +62,8 @@ const status = document.getElementById('status');
 const fullscreen = document.getElementById('fullscreen');
 const resolution = document.getElementById('resolution');
 const latencyButton = document.getElementById('low-latency');
+const frameDelayValue = document.getElementById('frame-delay');
+const pingValue = document.getElementById('ping');
 let lowLatency = false;
 let playback;
 let flipX = 1;
@@ -81,6 +83,61 @@ function showStatus(message) {
   status.hidden = !message;
   status.textContent = message;
   if (message) resolution.hidden = true;
+}
+
+function resetMetrics() {
+  frameDelayValue.textContent = '—';
+  pingValue.textContent = '—';
+}
+
+function monitorStream(signal) {
+  const recentPings = [];
+  let clockOffset;
+  let delayAverage;
+  let lastUpdate = -Infinity;
+
+  async function measurePing() {
+    while (!signal.aborted) {
+      const start = performance.now();
+      try {
+        const response = await fetch('/ping', { signal: AbortSignal.any([signal, AbortSignal.timeout(2500)]) });
+        const end = performance.now();
+        signal.throwIfAborted();
+        const received = parseFloat(response.headers.get('X-SideScreen-Received-Us')) / 1000;
+        const sent = parseFloat(response.headers.get('X-SideScreen-Sent-Us')) / 1000;
+        if (response.status !== 204 || !Number.isFinite(received) || !Number.isFinite(sent) || sent < received) {
+          throw new Error('Ping unavailable');
+        }
+
+        // Estimate the clock difference from the exchange with the least queuing delay.
+        const rtt = Math.max(0, (end - start) - (sent - received));
+        const offset = ((received - start) + (sent - end)) / 2;
+        recentPings.push({ rtt, offset });
+        if (recentPings.length > 8) recentPings.shift();
+        clockOffset = recentPings.reduce((best, sample) => sample.rtt <= best.rtt ? sample : best).offset;
+        pingValue.textContent = `${rtt < 10 ? rtt.toFixed(1) : Math.round(rtt)} ms`;
+      } catch {
+        if (signal.aborted) return;
+        recentPings.length = 0;
+        clockOffset = undefined;
+        delayAverage = undefined;
+        resetMetrics();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+
+  measurePing();
+  return (encodedAt) => {
+    if (clockOffset === undefined) return;
+    const now = performance.now();
+    const delay = Math.max(0, now + clockOffset - encodedAt);
+    delayAverage = delayAverage === undefined ? delay : 0.85 * delayAverage + 0.15 * delay;
+    if (now - lastUpdate >= 500) {
+      frameDelayValue.textContent = `≈ ${Math.round(delayAverage)} ms`;
+      lastUpdate = now;
+    }
+  };
 }
 
 fullscreen.hidden = !stage.requestFullscreen || !document.fullscreenEnabled;
@@ -116,6 +173,7 @@ async function showStream(mode, lowLatency, playbackSignal) {
   let decoderError;
   let pendingFrame;
   let drawRequest;
+  let measureFrame;
   let avc = false;
   let width = 0;
   let height = 0;
@@ -141,6 +199,7 @@ async function showStream(mode, lowLatency, playbackSignal) {
       try {
         if (signal.aborted) return;
         context.drawImage(latest, 0, 0, canvas.width, canvas.height);
+        measureFrame(Number(firstTimestamp) / 1e6 + latest.timestamp / 1000);
         if (!status.hidden) {
           clearTimeout(firstFrameTimer);
           showStatus('');
@@ -167,6 +226,7 @@ async function showStream(mode, lowLatency, playbackSignal) {
     if (response.headers.get('X-SideScreen-Transport') !== 'usb') {
       throw new Error('请重新运行 Mac 上的「打开鸿蒙副屏.command」。');
     }
+    measureFrame = monitorStream(signal);
     const stream = new StreamReader(response.body);
     showStatus('已连接，等待 Mac 画面…');
 
@@ -257,6 +317,7 @@ async function showStream(mode, lowLatency, playbackSignal) {
     if (drawRequest !== undefined) cancelAnimationFrame(drawRequest);
     pendingFrame?.close();
     wakeLock?.then((lock) => lock?.release()).catch(() => {});
+    if (!playbackSignal.aborted) resetMetrics();
   }
 }
 
@@ -287,6 +348,7 @@ async function run(signal, lowLatency) {
 
 function restartPlayback() {
   playback?.abort();
+  resetMetrics();
   if (document.hidden) return;
   playback = new AbortController();
   showStatus('正在连接 Mac…');

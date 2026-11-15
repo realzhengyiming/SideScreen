@@ -178,7 +178,12 @@ class ViewerServer(ThreadingHTTPServer):
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = 5
+    disable_nagle_algorithm = True
+
     def do_GET(self):
+        received_us = time.monotonic_ns() // 1000
         expected_host = f"{LOOPBACK}:{self.server.server_port}"
         if self.headers.get("Host") != expected_host or self.headers.get("Sec-Fetch-Site") == "cross-site":
             self.send_error(403)
@@ -192,7 +197,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 return
             self.serve_stream(hello)
             return
-        if self.path == "/":
+        if path.path == "/ping":
+            self.serve_ping(received_us)
+        elif self.path == "/":
             self.serve_page()
         elif self.path == "/viewer.js":
             self.serve_file("viewer.js", "text/javascript; charset=utf-8")
@@ -212,6 +219,17 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
         if usb_stream:
             self.send_header("X-SideScreen-Transport", "usb")
+            self.send_header("Connection", "close")
+        self.end_headers()
+
+    def serve_ping(self, received_us):
+        if not self.server.usb_ready.is_set():
+            self.send_error(503, "USB tunnel unavailable")
+            return
+        self.send_response(204)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-SideScreen-Received-Us", str(received_us))
+        self.send_header("X-SideScreen-Sent-Us", str(time.monotonic_ns() // 1000))
         self.end_headers()
 
     def serve_file(self, name, content_type):
@@ -235,8 +253,6 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.send_error(409, "Another viewer is already connected")
             return
         try:
-            self.connection.settimeout(5)
-            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 source = socket.create_connection((LOOPBACK, self.server.source_port), timeout=2)
             except OSError:

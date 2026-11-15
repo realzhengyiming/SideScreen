@@ -16,7 +16,12 @@
       position: absolute; inset: auto 16px 24px; margin: 0 auto; width: fit-content;
       max-width: calc(100% - 32px); padding: 10px 16px; border-radius: 10px; background: #222;
     }
-    .controls { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; align-items: flex-start; }
+    .overlay { position: absolute; top: 12px; right: 12px; display: grid; justify-items: end; gap: 6px; }
+    .controls { display: flex; gap: 8px; align-items: flex-start; }
+    .metrics {
+      display: flex; gap: 12px; padding: 5px 9px; border-radius: 6px; background: rgb(0 0 0 / 78%);
+      font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none;
+    }
     button {
       padding: 8px 14px; border: 1px solid #555;
       border-radius: 9px; background: #202020; color: #fff; font: inherit; cursor: pointer;
@@ -30,9 +35,15 @@
 <body>
   <main>
     <canvas aria-label="Mac 扩展桌面"></canvas>
-    <div class="controls">
-      <button id="low-latency" type="button" aria-pressed="false">低延迟</button>
-      <button id="fullscreen" type="button" aria-label="全屏">全屏<small id="resolution" hidden></small></button>
+    <div class="overlay">
+      <div class="metrics" aria-label="串流性能">
+        <span>画面延迟 <span id="frame-delay">—</span></span>
+        <span>Ping <span id="ping">—</span></span>
+      </div>
+      <div class="controls">
+        <button id="low-latency" type="button" aria-pressed="false">低延迟</button>
+        <button id="fullscreen" type="button" aria-label="全屏">全屏<small id="resolution" hidden></small></button>
+      </div>
     </div>
     <p id="status" role="status">正在连接 Mac…</p>
   </main>
