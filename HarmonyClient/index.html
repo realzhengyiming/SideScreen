@@ -16,19 +16,24 @@
       position: absolute; inset: auto 16px 24px; margin: 0 auto; width: fit-content;
       max-width: calc(100% - 32px); padding: 10px 16px; border-radius: 10px; background: #222;
     }
+    .controls { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; align-items: flex-start; }
     button {
-      position: absolute; top: 12px; right: 12px; padding: 8px 14px; border: 1px solid #555;
+      padding: 8px 14px; border: 1px solid #555;
       border-radius: 9px; background: #202020; color: #fff; font: inherit; cursor: pointer;
     }
+    button[aria-pressed="true"] { background: #193c65; border-color: #74aeef; }
     button small:not([hidden]) { display: block; margin-top: 2px; font-size: 11px; color: #ccc; }
-    :fullscreen button { display: none; }
+    :fullscreen .controls { display: none; }
   </style>
   <script type="module" src="/viewer.js"></script>
 </head>
 <body>
   <main>
     <canvas aria-label="Mac 扩展桌面"></canvas>
-    <button id="fullscreen" type="button" aria-label="全屏">全屏<small id="resolution" hidden></small></button>
+    <div class="controls">
+      <button id="low-latency" type="button" aria-pressed="false">低延迟</button>
+      <button id="fullscreen" type="button" aria-label="全屏">全屏<small id="resolution" hidden></small></button>
+    </div>
     <p id="status" role="status">正在连接 Mac…</p>
   </main>
 </body>

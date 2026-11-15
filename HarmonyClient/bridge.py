@@ -45,7 +45,11 @@ def stream_capabilities(query, panel):
     if panel is not None:
         target = tuple(sorted(panel, reverse=True))
         # A 60 Hz decoding budget, advertised independently of the panel size.
-        limit = tuple(max(256, side // 2) for side in target) if "compat" in params else target
+        limit = target
+        if "compat" in params:
+            limit = tuple(max(256, side // 2) for side in target)
+        elif "low_latency" in params:
+            limit = tuple(max(256, (side * 2 // 3) & ~1) for side in target)
         hello.extend((11, *encode_size(limit), 19, *encode_size(target)))
     hello.append(8)
     return hello
@@ -104,15 +108,20 @@ class UsbTunnel:
         return result.stdout + result.stderr
 
     def target(self):
+        rows = [line.split() for line in self.run("list", "targets", "-v").splitlines() if line.strip()]
+        if self.device:
+            rows = [fields for fields in rows if fields[0] == self.device]
         targets = []
-        for line in self.run("list", "targets", "-v").splitlines():
-            fields = line.split()
+        for fields in rows:
             if fields[1:3] == ["USB", "Connected"]:
                 targets.append(fields[0])
-        if self.device:
-            return self.device if self.device in targets else None
         if len(targets) > 1:
             raise RuntimeError("连接了多台鸿蒙设备，请用 --device 指定平板。")
+        if not targets:
+            if any("Unauthorized" in fields[1:3] for fields in rows):
+                raise RuntimeError("平板尚未授权，请解锁并点击「允许 USB 调试」。")
+            if any(fields[1:3] == ["TCP", "Connected"] for fields in rows):
+                raise RuntimeError("只检测到了无线调试。请用数据线直连 Mac，并开启平板的「USB 调试」。")
         return targets[0] if targets else None
 
     def ensure(self, target):
@@ -131,7 +140,10 @@ class UsbTunnel:
 
     def panel_size(self, target):
         # The browser's CSS pixels can be scaled by system display settings.
-        output = self.run("-t", target, "shell", "hidumper -s RenderService -a screen")
+        try:
+            output = self.run("-t", target, "shell", "hidumper -s RenderService -a screen")
+        except (OSError, subprocess.SubprocessError):
+            return None
         match = re.search(r"physical resolution=(\d+)x(\d+), isVirtual=false", output)
         if match:
             try:
@@ -161,6 +173,7 @@ class ViewerServer(ThreadingHTTPServer):
         super().__init__((LOOPBACK, viewer_port), ViewerHandler)
         self.source_port = source_port
         self.stream_lock = threading.Lock()
+        self.usb_ready = threading.Event()
         self.panel_size = None
 
 
@@ -189,7 +202,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def headers_for(self, content_type, length=None):
+    def headers_for(self, content_type, length=None, usb_stream=False):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
@@ -197,6 +210,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'")
         if length is not None:
             self.send_header("Content-Length", str(length))
+        if usb_stream:
+            self.send_header("X-SideScreen-Transport", "usb")
         self.end_headers()
 
     def serve_file(self, name, content_type):
@@ -213,23 +228,30 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def serve_stream(self, hello):
+        if not self.server.usb_ready.is_set():
+            self.send_error(503, "USB tunnel unavailable")
+            return
         if not self.server.stream_lock.acquire(blocking=False):
             self.send_error(409, "Another viewer is already connected")
             return
         try:
             self.connection.settimeout(5)
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 source = socket.create_connection((LOOPBACK, self.server.source_port), timeout=2)
             except OSError:
-                self.send_error(503, "Start USB streaming in SideScreen on the Mac")
+                self.send_error(502, "Start USB streaming in SideScreen on the Mac")
                 return
             with source:
+                source.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 source.sendall(hello)
-                self.headers_for("application/octet-stream")
-                while True:
-                    ready, _, _ = select.select([source, self.connection], [], [])
+                self.headers_for("application/octet-stream", usb_stream=True)
+                while self.server.usb_ready.is_set():
+                    ready, _, _ = select.select([source, self.connection], [], [], 1)
                     if self.connection in ready:
                         return
+                    if source not in ready:
+                        continue
                     data = source.recv(65536)
                     if not data:
                         return
@@ -272,32 +294,40 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     mac_process = None
+    start_mac = not args.no_start_mac
     try:
-        if not args.no_start_mac:
-            if MAC_APP.is_dir():
-                mac_process = subprocess.Popen([
-                    MAC_APP / "Contents/MacOS/SideScreen", "--harmony-usb", "-SideScreen_port", str(args.mac_port),
-                ])
-            else:
-                subprocess.run(["/usr/bin/open", "-g", "-b", "com.sidescreen.app"], check=False)
         while True:
+            usb_ready = False
             try:
                 target = tunnel.target()
                 if target != last_target:
+                    server.usb_ready.clear()
                     server.panel_size = tunnel.panel_size(target) if target else None
                     last_target = target
                 if target is None:
-                    status = "等待鸿蒙平板连接，请插入数据线并在平板允许 USB 调试。"
+                    status = "未检测到鸿蒙 USB 调试设备。请解锁平板、开启 USB 调试，并用数据线直连 Mac。"
                 else:
                     tunnel.ensure(target)
+                    server.usb_ready.set()
+                    usb_ready = True
                     size = server.panel_size
                     panel = f"（{max(size)}×{min(size)}）" if size else ""
                     status = f"USB 已连接{panel}，平板浏览器地址为 {tunnel.url}"
+                    if start_mac:
+                        if MAC_APP.is_dir():
+                            mac_process = subprocess.Popen([
+                                MAC_APP / "Contents/MacOS/SideScreen", "--harmony-usb", "-SideScreen_port", str(args.mac_port),
+                            ])
+                        else:
+                            subprocess.run(["/usr/bin/open", "-g", "-b", "com.sidescreen.app"], check=False)
+                        start_mac = False
                     if should_open:
                         tunnel.open_viewer(target)
                         should_open = False
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 status = str(error)
+            if not usb_ready:
+                server.usb_ready.clear()
             if status != previous_status:
                 print(status, flush=True)
                 previous_status = status

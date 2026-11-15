@@ -4,7 +4,6 @@ const CODEC_SELECTED = 10;
 const H264 = 1;
 const HEVC_MAIN = 'hev1.1.6.L153.B0';
 const MAX_FRAME_SIZE = 32 * 1024 * 1024;
-const MAX_DECODE_QUEUE = 8;
 
 class StreamReader {
   constructor(body) {
@@ -62,6 +61,9 @@ const context = canvas.getContext('2d', { alpha: false, desynchronized: true });
 const status = document.getElementById('status');
 const fullscreen = document.getElementById('fullscreen');
 const resolution = document.getElementById('resolution');
+const latencyButton = document.getElementById('low-latency');
+let lowLatency = false;
+let playback;
 let flipX = 1;
 let flipY = 1;
 
@@ -78,6 +80,7 @@ function fitCanvas() {
 function showStatus(message) {
   status.hidden = !message;
   status.textContent = message;
+  if (message) resolution.hidden = true;
 }
 
 fullscreen.hidden = !stage.requestFullscreen || !document.fullscreenEnabled;
@@ -105,8 +108,10 @@ async function prefersHevc(width, height) {
   }
 }
 
-async function showStream(mode) {
+async function showStream(mode, lowLatency, playbackSignal) {
   const connection = new AbortController();
+  const signal = AbortSignal.any([connection.signal, playbackSignal]);
+  const maxDecodeQueue = lowLatency ? 3 : 8;
   let decoder;
   let decoderError;
   let pendingFrame;
@@ -119,10 +124,6 @@ async function showStream(mode) {
   let needKeyframe = true;
   let wakeLock;
   let firstFrameTimer;
-
-  function stopWhenHidden() {
-    if (document.hidden) connection.abort();
-  }
 
   function closeDecoder() {
     if (decoder && decoder.state !== 'closed') decoder.close();
@@ -138,11 +139,12 @@ async function showStream(mode) {
       pendingFrame = undefined;
       drawRequest = undefined;
       try {
+        if (signal.aborted) return;
         context.drawImage(latest, 0, 0, canvas.width, canvas.height);
         if (!status.hidden) {
           clearTimeout(firstFrameTimer);
           showStatus('');
-          resolution.textContent = `${canvas.width}×${canvas.height}`;
+          resolution.textContent = `USB · ${canvas.width}×${canvas.height}`;
           resolution.hidden = false;
           wakeLock ??= navigator.wakeLock?.request('screen').catch(() => undefined);
         }
@@ -152,15 +154,19 @@ async function showStream(mode) {
     });
   }
 
-  document.addEventListener('visibilitychange', stopWhenHidden);
   try {
     const [screenWidth, screenHeight] = screenPixels();
     const params = new URLSearchParams({ w: screenWidth, h: screenHeight, codec: mode.codec });
     if (mode.compat) params.set('compat', '1');
-    const response = await fetch(`/stream?${params}`, { signal: connection.signal });
-    if (response.status === 503) throw new Error('正在等待 Mac 串流。请确认 SideScreen 已在 USB 模式启动。');
+    if (lowLatency) params.set('low_latency', '1');
+    const response = await fetch(`/stream?${params}`, { signal });
+    if (response.status === 503) throw new Error('USB 转发还没连通，请检查数据线和「USB 调试」授权。');
+    if (response.status === 502) throw new Error('正在等待 Mac 串流，请查看 Mac 上的 SideScreen 窗口。');
     if (response.status === 409) throw new Error('已有副屏页面在播放，请关闭另一标签页。');
     if (!response.ok || !response.body) throw new Error('USB 连接暂时不可用，正在重试…');
+    if (response.headers.get('X-SideScreen-Transport') !== 'usb') {
+      throw new Error('请重新运行 Mac 上的「打开鸿蒙副屏.command」。');
+    }
     const stream = new StreamReader(response.body);
     showStatus('已连接，等待 Mac 画面…');
 
@@ -188,7 +194,6 @@ async function showStream(mode) {
           height = newHeight;
           canvas.width = width;
           canvas.height = height;
-          resolution.hidden = true;
           showStatus('正在调整画面…');
           clearTimeout(firstFrameTimer);
           firstFrameTimer = undefined;
@@ -209,7 +214,7 @@ async function showStream(mode) {
       const captureTime = header.getBigUint64(5);
       const bytes = await stream.read(length);
 
-      if (decoder && decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
+      if (decoder && decoder.decodeQueueSize >= maxDecodeQueue) {
         closeDecoder();
         needKeyframe = true;
       }
@@ -217,6 +222,7 @@ async function showStream(mode) {
         if (!keyframe) continue;
         const config = decoderConfig(avc ? codecFromKeyframe(bytes) : HEVC_MAIN, width, height);
         const { supported } = await VideoDecoder.isConfigSupported(config);
+        signal.throwIfAborted();
         if (!supported) throw new UnsupportedCodecError('平板浏览器无法解码这档画质。');
         decoder = new VideoDecoder({
           output: draw,
@@ -247,7 +253,6 @@ async function showStream(mode) {
   } finally {
     clearTimeout(firstFrameTimer);
     connection.abort();
-    document.removeEventListener('visibilitychange', stopWhenHidden);
     closeDecoder();
     if (drawRequest !== undefined) cancelAnimationFrame(drawRequest);
     pendingFrame?.close();
@@ -255,11 +260,7 @@ async function showStream(mode) {
   }
 }
 
-async function run() {
-  if (!globalThis.VideoDecoder || !context) {
-    showStatus('此浏览器缺少实时视频解码功能，请使用鸿蒙系统浏览器打开。');
-    return;
-  }
+async function run(signal, lowLatency) {
   const [width, height] = screenPixels().sort((a, b) => b - a);
   const modes = [
     { codec: 'avc', compat: false },
@@ -267,14 +268,11 @@ async function run() {
   ];
   if (await prefersHevc(width, height)) modes.unshift({ codec: 'hevc', compat: false });
   let currentMode = 0;
-  while (true) {
-    if (document.hidden) {
-      await new Promise((resolve) => document.addEventListener('visibilitychange', resolve, { once: true }));
-      continue;
-    }
+  while (!signal.aborted) {
     try {
-      await showStream(modes[currentMode]);
+      await showStream(modes[currentMode], lowLatency, signal);
     } catch (error) {
+      if (signal.aborted) return;
       if (error instanceof UnsupportedCodecError && currentMode + 1 < modes.length) {
         currentMode += 1;
         showStatus('正在切换到兼容画质…');
@@ -287,4 +285,26 @@ async function run() {
   }
 }
 
-run();
+function restartPlayback() {
+  playback?.abort();
+  if (document.hidden) return;
+  playback = new AbortController();
+  showStatus('正在连接 Mac…');
+  run(playback.signal, lowLatency);
+}
+
+if (!globalThis.VideoDecoder || !context) {
+  latencyButton.hidden = true;
+  showStatus('此浏览器缺少实时视频解码功能，请使用鸿蒙系统浏览器打开。');
+} else {
+  try { lowLatency = localStorage.getItem('sidescreen-low-latency') === '1'; } catch {}
+  latencyButton.setAttribute('aria-pressed', String(lowLatency));
+  latencyButton.addEventListener('click', () => {
+    lowLatency = !lowLatency;
+    latencyButton.setAttribute('aria-pressed', String(lowLatency));
+    try { localStorage.setItem('sidescreen-low-latency', lowLatency ? '1' : '0'); } catch {}
+    restartPlayback();
+  });
+  document.addEventListener('visibilitychange', restartPlayback);
+  restartPlayback();
+}
