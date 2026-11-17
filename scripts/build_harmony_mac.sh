@@ -9,6 +9,12 @@ if [[ -e "$destination" ]]; then
     exit 1
 fi
 
+hdc=$(PYTHONPATH="$root/HarmonyClient" python3 -B -c 'from bridge import find_hdc; print(find_hdc() or "")')
+if [[ -z "$hdc" ]]; then
+    printf 'Cannot find hdc. Install the HarmonyOS SDK or set SIDESCREEN_HDC.\n' >&2
+    exit 1
+fi
+
 cd "$root/MacHost"
 swift_options=()
 macos_sdk=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
@@ -21,29 +27,49 @@ swift build ${swift_options[@]+"${swift_options[@]}"} -c debug
 bin=$(swift build ${swift_options[@]+"${swift_options[@]}"} -c debug --show-bin-path)
 
 contents="$destination/Contents"
-mkdir -p "$contents/MacOS" "$contents/Frameworks" "$contents/Resources"
+mkdir -p "$contents/MacOS" "$contents/Frameworks" "$contents/Resources/HarmonyClient" "$contents/Helpers/HarmonyOS"
 cp "$bin/SideScreen" "$contents/MacOS/SideScreen"
 ditto "$bin/Sparkle.framework" "$contents/Frameworks/Sparkle.framework"
+cp "$root/HarmonyClient/bridge.py" "$root/HarmonyClient/index.html" "$root/HarmonyClient/viewer.js" "$contents/Resources/HarmonyClient/"
+cp "$root/MacHost/Resources/HarmonyAppIcon.icns" "$contents/Resources/"
+cp "$root/LICENSE" "$contents/Resources/SideScreen-LICENSE"
+cp "$hdc" "$contents/Helpers/HarmonyOS/hdc"
+hdc_directory=$(dirname "$hdc")
+for library in "$hdc_directory"/*.dylib; do
+    [[ -f "$library" ]] || continue
+    cp "$library" "$contents/Helpers/HarmonyOS/"
+done
+if [[ -f "$hdc_directory/NOTICE.txt" ]]; then
+    cp "$hdc_directory/NOTICE.txt" "$contents/Resources/HarmonyOS-NOTICE.txt"
+fi
+
+identity=${SIDESCREEN_SIGN_IDENTITY:--}
+for helper in "$contents/Helpers/HarmonyOS/"*.dylib "$contents/Helpers/HarmonyOS/hdc"; do
+    [[ -f "$helper" ]] || continue
+    codesign --force --sign "$identity" "$helper"
+done
 
 version=$(tr -d '[:space:]' < "$root/VERSION")
 cat > "$contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>CFBundleName</key><string>SideScreen Harmony</string>
-    <key>CFBundleDisplayName</key><string>SideScreen Harmony</string>
+    <key>CFBundleName</key><string>鸿蒙副屏</string>
+    <key>CFBundleDisplayName</key><string>鸿蒙副屏</string>
     <key>CFBundleIdentifier</key><string>com.sidescreen.harmony</string>
     <key>CFBundleExecutable</key><string>SideScreen</string>
+    <key>CFBundleIconFile</key><string>HarmonyAppIcon</string>
+    <key>SideScreenHarmonyUSB</key><true/>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSScreenCaptureUsageDescription</key><string>SideScreen captures its virtual display to show it on the tablet over USB.</string>
+    <key>NSScreenCaptureUsageDescription</key><string>鸿蒙副屏需要录制 Mac 的扩展桌面，并通过 USB 显示到你的平板。</string>
     <key>NSLocalNetworkUsageDescription</key><string>SideScreen uses the local network when wireless mode is selected.</string>
     <key>NSBonjourServices</key><array><string>_sidescreen._tcp</string></array>
 </dict></plist>
 EOF
 
-"$root/scripts/sign_app.sh" "$destination" -
+"$root/scripts/sign_app.sh" "$destination" "$identity"
 printf '%s\n' "$destination"

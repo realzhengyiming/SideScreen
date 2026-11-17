@@ -3,6 +3,7 @@
 
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import os
 from pathlib import Path
 import re
@@ -288,6 +289,8 @@ def main():
     parser.add_argument("--device", help="多台设备时的 USB 设备标识，可用 hdc list targets -v 查看")
     parser.add_argument("--no-open", action="store_true", help="由你在平板上手动打开浏览器")
     parser.add_argument("--no-start-mac", action="store_true", help="连接已经运行的 Mac 串流服务")
+    parser.add_argument("--status-json", action="store_true", help="向 Mac 应用输出 JSON 连接状态")
+    parser.add_argument("--parent-pid", type=int, help="随启动此服务的 Mac 应用退出")
     args = parser.parse_args()
     hdc = find_hdc()
     if hdc is None:
@@ -309,10 +312,18 @@ def main():
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
+
+    def reopen(_signal, _frame):
+        nonlocal should_open
+        should_open = True
+
+    signal.signal(signal.SIGUSR1, reopen)
     mac_process = None
     start_mac = not args.no_start_mac
     try:
         while True:
+            if args.parent_pid is not None and os.getppid() != args.parent_pid:
+                break
             usb_ready = False
             try:
                 target = tunnel.target()
@@ -320,6 +331,7 @@ def main():
                     server.usb_ready.clear()
                     server.panel_size = tunnel.panel_size(target) if target else None
                     last_target = target
+                    should_open = not args.no_open
                 if target is None:
                     status = "未检测到鸿蒙 USB 调试设备。请解锁平板、开启 USB 调试，并用数据线直连 Mac。"
                 else:
@@ -345,7 +357,10 @@ def main():
             if not usb_ready:
                 server.usb_ready.clear()
             if status != previous_status:
-                print(status, flush=True)
+                if args.status_json:
+                    print(json.dumps({"connected": usb_ready, "message": status}, ensure_ascii=False), flush=True)
+                else:
+                    print(status, flush=True)
                 previous_status = status
             time.sleep(3)
     except KeyboardInterrupt:

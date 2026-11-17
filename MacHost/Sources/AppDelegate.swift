@@ -50,6 +50,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var screenCapture: ScreenCapture?
     var virtualDisplayManager: VirtualDisplayManager?
     var settings = DisplaySettings()
+    let harmonyBridge = HarmonyBridgeController()
     var settingsWindow: SettingsWindowController?
     var statusItem: NSStatusItem?
     let pairedDeviceStore = PairedDeviceStore()
@@ -81,9 +82,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the refresh-rate observer skip restarts that would change nothing.
     private var lastAppliedRefreshRate: Int?
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
+    private var isHarmonySession: Bool {
+        HarmonyBridgeController.isApp || ProcessInfo.processInfo.arguments.contains("--harmony-usb")
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
+
+        if HarmonyBridgeController.isApp { settings.connectionMode = .usb }
 
         // Create menu bar item
         setupMenuBar()
@@ -94,9 +100,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Setup settings observers
         setupSettingsObservers()
 
-        // Check permissions
-        Task {
-            await checkPermissions()
+        // The Harmony auto-start path below checks permissions before capture.
+        if !HarmonyBridgeController.isApp {
+            Task { await checkPermissions() }
         }
 
         // Periodic status refresh for the per-mode checklist (ADB / WiFi / Listening IP).
@@ -125,7 +131,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Declarative auto-start (no Mac interaction): start the server in the
         // chosen Startup mode if enabled. No blocking permission modal here —
         // it cannot be acted on when the Mac is headless.
-        let harmonyUSB = ProcessInfo.processInfo.arguments.contains("--harmony-usb")
+        if HarmonyBridgeController.isApp {
+            harmonyBridge.start(port: settings.port)
+        }
+        let harmonyUSB = isHarmonySession
         if harmonyUSB || settings.autoStartStreamingOnLaunch {
             let mode: ConnectionMode = harmonyUSB ? .usb : settings.startupMode
             if settings.connectionMode != mode { settings.connectionMode = mode }
@@ -144,11 +153,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !flag {
             showSettings()
         }
+        if HarmonyBridgeController.isApp { harmonyBridge.reopenViewer() }
         return true
     }
 
     @MainActor
     private func refreshStatusIndicators() {
+        if HarmonyBridgeController.isApp {
+            // A granted permission can become visible while the settings page is open.
+            let granted = CGPreflightScreenCaptureAccess()
+            let justGranted = granted && !settings.hasScreenRecordingPermission
+            settings.hasScreenRecordingPermission = granted
+            settings.usbDeviceConnected = harmonyBridge.usbConnected
+            if justGranted {
+                Task { await self.startServer() }
+            }
+            return
+        }
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
@@ -387,7 +408,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupSettingsWindow() {
-        settingsWindow = SettingsWindowController(settings: settings)
+        if HarmonyBridgeController.isApp {
+            settingsWindow = SettingsWindowController(settings: settings, bridge: harmonyBridge) { [weak self] in
+                guard let self else { return }
+                self.harmonyBridge.reconnect(port: self.settings.port)
+                if self.settings.hasScreenRecordingPermission && !self.settings.isRunning {
+                    Task { await self.startServer() }
+                }
+            }
+        } else {
+            settingsWindow = SettingsWindowController(settings: settings)
+        }
 
         settings.onToggleServer = { [weak self] in
             guard let self else { return }
@@ -463,6 +494,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Setup ADB reverse port forwarding for USB connection
     func setupADBReverse() async {
+        if isHarmonySession { return }
         let port = settings.port
         print("🔌 Setting up ADB reverse for port \(port)...")
         debugLog("🔌 setupADBReverse() invoked for port \(port)...")
@@ -711,15 +743,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Create the virtual display from the current settings, in extend mode.
     private func createVirtualDisplay(on manager: VirtualDisplayManager) throws {
+        manager.automaticallyAssignRole = isHarmonySession
+        manager.onDisplayRoleChanged = { [weak self, weak manager] role in
+            Task { @MainActor in
+                guard let self, let manager, self.virtualDisplayManager === manager else { return }
+                self.settings.displayRole = role
+            }
+        }
         let size = desktopSize
         try manager.createDisplay(
             width: size.width,
             height: size.height,
             refreshRate: tabletDisplayMode == nil ? settings.refreshRate : streamRefreshRate,
             hiDPI: tabletDisplayMode != nil || settings.hiDPI,
-            name: "SideScreen"
+            name: isHarmonySession ? "鸿蒙副屏" : "SideScreen"
         )
 
+        if isHarmonySession { return }
         // Disable mirror mode (may fail if already in extend mode)
         do {
             try manager.disableMirrorMode()
@@ -943,6 +983,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         streamingServer = nil
         virtualDisplayManager = nil
         settings.tabletDisplayMode = nil
+        settings.displayRole = nil
         clientPreparation = nil
         currentWirelessDevice = nil
 
@@ -1354,6 +1395,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         momentumVelocityY = 0
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard HarmonyBridgeController.isApp, harmonyBridge.isRunning else { return .terminateNow }
+        harmonyBridge.stop { sender.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         // Stop momentum scrolling
         stopMomentumScroll()
@@ -1375,6 +1422,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+
+        if HarmonyBridgeController.isApp {
+            let status = NSMenuItem(title: settings.clientConnected ? "副屏已连接" : harmonyBridge.message, action: nil, keyEquivalent: "")
+            status.isEnabled = false
+            menu.addItem(status)
+            menu.addItem(.separator())
+            let settingsItem = NSMenuItem(title: "打开鸿蒙副屏…", action: #selector(showSettings), keyEquivalent: "s")
+            settingsItem.target = self
+            menu.addItem(settingsItem)
+            menu.addItem(NSMenuItem(title: "退出鸿蒙副屏", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+            return
+        }
 
         // Live status line (not clickable)
         let statusTitle: String

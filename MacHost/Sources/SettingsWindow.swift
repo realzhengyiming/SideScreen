@@ -1358,6 +1358,7 @@ class DisplaySettings: ObservableObject {
     @Published var displayCreated = false
     @Published var clientConnected = false
     @Published var tabletDisplayMode: TabletDisplayMode?
+    @Published var displayRole: DisplayRole?
     /// Device name of the wireless client currently streaming (nil when none).
     /// WirelessSection reads this to show a "Connected" badge on the matching row.
     @Published var currentWirelessDevice: String?

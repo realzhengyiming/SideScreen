@@ -3,12 +3,20 @@ import AppKit
 import CoreGraphics
 import CGVirtualDisplayBridge
 
+enum DisplayRole: String {
+    case primary = "主屏幕"
+    case extended = "扩展副屏"
+}
+
 /// Manages virtual display creation and lifecycle using CGVirtualDisplay API
 class VirtualDisplayManager {
     private var virtualDisplay: CGVirtualDisplay?
     private var displayDescriptor: CGVirtualDisplayDescriptor?
     private var displaySettings: CGVirtualDisplaySettings?
     private var screenParamsObserver: NSObjectProtocol?
+    private var isApplyingAutomaticRole = false
+    var automaticallyAssignRole = false
+    var onDisplayRoleChanged: ((DisplayRole) -> Void)?
 
     var displayID: CGDirectDisplayID? {
         return virtualDisplay?.displayID
@@ -272,6 +280,10 @@ class VirtualDisplayManager {
 
     /// Restore saved display position
     func restoreDisplayPosition() {
+        if automaticallyAssignRole && onlinePhysicalDisplays().isEmpty {
+            ensurePhysicalDisplayStaysMain()
+            return
+        }
         // Run the main-display safety net on every path, including early
         // returns: WindowServer can re-adopt the virtual display as main from
         // its own remembered arrangement even when we restore nothing (#39).
@@ -321,6 +333,14 @@ class VirtualDisplayManager {
     /// screen nobody can see, which presents as a completely unresponsive Mac.
     /// No-ops in true headless operation (no physical display online).
     func ensurePhysicalDisplayStaysMain() {
+        if automaticallyAssignRole {
+            do {
+                try applyAutomaticDisplayRole()
+            } catch {
+                debugLog("Automatic display arrangement failed: \(error)")
+            }
+            return
+        }
         guard let displayID = displayID else { return }
         guard CGMainDisplayID() == displayID,
               let physicalMain = onlinePhysicalDisplays().first else { return }
@@ -344,6 +364,62 @@ class VirtualDisplayManager {
         if CGCompleteDisplayConfiguration(config, .forSession) == CGError.success {
             print("🛟 Physical display restored as main — virtual display parked beside it")
         }
+    }
+
+    /// Keep the tablet independent, promoting it only when it is the sole screen.
+    /// Called again on hot-plug and mirroring changes by the screen observer.
+    private func applyAutomaticDisplayRole() throws {
+        guard let tablet = displayID, CGDisplayIsOnline(tablet) != 0,
+              !isApplyingAutomaticRole else { return }
+        isApplyingAutomaticRole = true
+        defer { isApplyingAutomaticRole = false }
+
+        let others = onlinePhysicalDisplays()
+        let currentMain = CGMainDisplayID()
+        let main = others.contains(currentMain) ? currentMain : (others.first ?? tablet)
+        let role: DisplayRole = others.isEmpty ? .primary : .extended
+        let tabletBounds = CGDisplayBounds(tablet)
+        let mirrored = CGDisplayIsInMirrorSet(tablet) != 0
+        let changeMain = main != currentMain
+        let moveTablet = role == .primary
+            ? tabletBounds.origin != .zero || changeMain
+            : changeMain || mirrored || others.contains { tabletBounds.intersects(CGDisplayBounds($0)) }
+
+        guard mirrored || changeMain || moveTablet else {
+            onDisplayRoleChanged?(role)
+            return
+        }
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let config else {
+            throw VirtualDisplayError.configurationFailed("Cannot begin automatic arrangement")
+        }
+        var result = CGError.success
+        if mirrored {
+            // Also release physical screens that were mirroring the tablet.
+            let mirrors = others.filter { CGDisplayMirrorsDisplay($0) == tablet }
+            for screen in [tablet] + mirrors {
+                result = CGConfigureDisplayMirrorOfDisplay(config, screen, kCGNullDirectDisplay)
+                if result != .success { break }
+            }
+        }
+        if result == .success && changeMain && main != tablet {
+            result = CGConfigureDisplayOrigin(config, main, 0, 0)
+        }
+        if result == .success && moveTablet {
+            let rightEdge = others.map { CGDisplayBounds($0).maxX }.max() ?? 0
+            let x = role == .primary ? 0 : Int32(rightEdge - CGDisplayBounds(main).minX)
+            result = CGConfigureDisplayOrigin(config, tablet, x, 0)
+        }
+        guard result == .success else {
+            CGCancelDisplayConfiguration(config)
+            throw VirtualDisplayError.configurationFailed("Cannot arrange tablet display (\(result.rawValue))")
+        }
+        let completed = CGCompleteDisplayConfiguration(config, .forSession)
+        guard completed == .success else {
+            throw VirtualDisplayError.configurationFailed("Cannot apply tablet arrangement (\(completed.rawValue))")
+        }
+        debugLog("Harmony display role: \(role.rawValue), tablet \(tablet), main \(CGMainDisplayID())")
+        onDisplayRoleChanged?(CGMainDisplayID() == tablet ? .primary : .extended)
     }
 
     /// Verify the virtual display is registered in the system display list
