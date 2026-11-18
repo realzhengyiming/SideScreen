@@ -16,15 +16,16 @@
       position: absolute; inset: auto 16px 24px; margin: 0 auto; width: fit-content;
       max-width: calc(100% - 32px); padding: 10px 16px; border-radius: 10px; background: #222;
     }
-    .overlay { position: absolute; top: 12px; right: 12px; display: grid; justify-items: end; gap: 6px; }
+    .overlay { position: absolute; top: 12px; right: 12px; display: grid; justify-items: end; gap: 6px; pointer-events: none; }
     .controls { display: flex; gap: 8px; align-items: flex-start; }
     .metrics {
-      display: flex; gap: 12px; padding: 5px 9px; border-radius: 6px; background: rgb(0 0 0 / 78%);
-      font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none;
+      display: flex; gap: 12px; padding: 5px 9px; border-radius: 6px;
+      background: rgb(0 0 0 / 22%); color: rgb(255 255 255 / 78%); text-shadow: 0 0 2px rgb(0 0 0 / 85%);
+      font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap;
     }
     button {
       padding: 8px 14px; border: 1px solid #555;
-      border-radius: 9px; background: #202020; color: #fff; font: inherit; cursor: pointer;
+      border-radius: 9px; background: #202020; color: #fff; font: inherit; cursor: pointer; pointer-events: auto;
     }
     button[aria-pressed="true"] { background: #193c65; border-color: #74aeef; }
     button small:not([hidden]) { display: block; margin-top: 2px; font-size: 11px; color: #ccc; }
