@@ -3,6 +3,7 @@
 
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -154,7 +155,11 @@ class UsbTunnel:
         return None
 
     def open_viewer(self, target):
-        output = self.run("-t", target, "shell", "aa", "start", "-A", "ohos.want.action.viewData", "-U", self.url)
+        assets = b"".join((HERE / name).read_bytes() for name in ("index.html", "viewer.js", "decoder-worker.js"))
+        version = hashlib.sha256(assets).hexdigest()[:12]
+        separator = "&" if "?" in self.url else "?"
+        url = f"{self.url}{separator}v={version}"
+        output = self.run("-t", target, "shell", "aa", "start", "-A", "ohos.want.action.viewData", "-U", url)
         if "start ability successfully" in output:
             return
         if "10106102" in output:
@@ -176,6 +181,7 @@ class ViewerServer(ThreadingHTTPServer):
         self.stream_lock = threading.Lock()
         self.usb_ready = threading.Event()
         self.panel_size = None
+        self.viewer_metrics = {}
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
@@ -199,11 +205,15 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.serve_stream(hello)
             return
         if path.path == "/ping":
-            self.serve_ping(received_us)
-        elif self.path == "/":
+            self.serve_ping(received_us, path.query)
+        elif path.path == "/metrics":
+            data = json.dumps(self.server.viewer_metrics).encode("utf-8")
+            self.headers_for("application/json", len(data))
+            self.wfile.write(data)
+        elif path.path == "/":
             self.serve_page()
-        elif self.path == "/viewer.js":
-            self.serve_file("viewer.js", "text/javascript; charset=utf-8")
+        elif path.path in ("/viewer.js", "/decoder-worker.js"):
+            self.serve_file(path.path[1:], "text/javascript; charset=utf-8")
         elif self.path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
@@ -223,10 +233,21 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
         self.end_headers()
 
-    def serve_ping(self, received_us):
+    def serve_ping(self, received_us, query):
         if not self.server.usb_ready.is_set():
             self.send_error(503, "USB tunnel unavailable")
             return
+        values = parse_qs(query)
+        metrics = {}
+        for name in ("frameMs", "decodeMs", "renderMs", "fetchMs", "httpMs", "requestQueueMs", "scheduleMs", "worker"):
+            try:
+                value = float(values[name][0])
+            except (KeyError, ValueError):
+                continue
+            if 0 <= value <= 60000:
+                metrics[name] = round(value, 2)
+        if metrics:
+            self.server.viewer_metrics = {**metrics, "updatedAt": time.monotonic()}
         self.send_response(204)
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-SideScreen-Received-Us", str(received_us))

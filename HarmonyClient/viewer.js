@@ -56,8 +56,9 @@ function codecFromKeyframe(bytes) {
 }
 
 const stage = document.querySelector('main');
-const canvas = document.querySelector('canvas');
-const context = canvas.getContext('2d', { alpha: false, desynchronized: true });
+let canvas = document.querySelector('canvas');
+let context;
+let workerAvailable = true;
 const status = document.getElementById('status');
 const fullscreen = document.getElementById('fullscreen');
 const resolution = document.getElementById('resolution');
@@ -70,12 +71,14 @@ let flipX = 1;
 let flipY = 1;
 
 function fitCanvas() {
+  const width = Number(canvas.dataset.width) || canvas.width;
+  const height = Number(canvas.dataset.height) || canvas.height;
   const scale = Math.min(
-    stage.clientWidth / canvas.width,
-    stage.clientHeight / canvas.height,
+    stage.clientWidth / width,
+    stage.clientHeight / height,
   );
-  canvas.style.width = `${canvas.width * scale}px`;
-  canvas.style.height = `${canvas.height * scale}px`;
+  canvas.style.width = `${width * scale}px`;
+  canvas.style.height = `${height * scale}px`;
   canvas.style.transform = `scale(${flipX}, ${flipY})`;
 }
 
@@ -92,6 +95,7 @@ function resetMetrics() {
 
 function monitorStream(signal) {
   const recentPings = [];
+  const metrics = {};
   let clockOffset;
   let delayAverage;
   let lastUpdate = -Infinity;
@@ -100,7 +104,10 @@ function monitorStream(signal) {
     while (!signal.aborted) {
       const start = performance.now();
       try {
-        const response = await fetch('/ping', { signal: AbortSignal.any([signal, AbortSignal.timeout(2500)]) });
+        const query = new URLSearchParams({ ...metrics, sample: String(start) });
+        const url = new URL(`/ping?${query}`, location.href);
+        const response = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(2500)]) });
+        await response.arrayBuffer();
         const end = performance.now();
         signal.throwIfAborted();
         const received = parseFloat(response.headers.get('X-SideScreen-Received-Us')) / 1000;
@@ -110,8 +117,20 @@ function monitorStream(signal) {
         }
 
         // Estimate the clock difference from the exchange with the least queuing delay.
-        const rtt = Math.max(0, (end - start) - (sent - received));
-        const offset = ((received - start) + (sent - end)) / 2;
+        metrics.fetchMs = Math.max(0, (end - start) - (sent - received));
+        const timing = performance.getEntriesByName(url.href).pop();
+        performance.clearResourceTimings();
+        let exchangeStart = start;
+        let exchangeEnd = end;
+        if (timing?.responseEnd > 0 && timing.requestStart > 0) {
+          exchangeStart = timing.requestStart;
+          exchangeEnd = timing.responseEnd;
+          metrics.scheduleMs = Math.max(0, end - timing.responseEnd);
+          metrics.requestQueueMs = Math.max(0, timing.requestStart - start);
+        }
+        const rtt = Math.max(0, exchangeEnd - exchangeStart - (sent - received));
+        metrics.httpMs = rtt;
+        const offset = ((received - exchangeStart) + (sent - exchangeEnd)) / 2;
         recentPings.push({ rtt, offset });
         if (recentPings.length > 8) recentPings.shift();
         clockOffset = recentPings.reduce((best, sample) => sample.rtt <= best.rtt ? sample : best).offset;
@@ -128,11 +147,15 @@ function monitorStream(signal) {
   }
 
   measurePing();
-  return (encodedAt) => {
+  return (encodedAt, decodeMs, renderMs, renderedAt = performance.now(), worker = false) => {
     if (clockOffset === undefined) return;
-    const now = performance.now();
+    const now = renderedAt;
     const delay = Math.max(0, now + clockOffset - encodedAt);
     delayAverage = delayAverage === undefined ? delay : 0.85 * delayAverage + 0.15 * delay;
+    metrics.frameMs = delayAverage;
+    metrics.decodeMs = decodeMs;
+    metrics.renderMs = renderMs;
+    metrics.worker = Number(worker);
     if (now - lastUpdate >= 500) {
       frameDelayValue.textContent = `≈ ${Math.round(delayAverage)} ms`;
       lastUpdate = now;
@@ -148,6 +171,58 @@ class UnsupportedCodecError extends Error {}
 
 function decoderConfig(codec, width, height) {
   return { codec, codedWidth: width, codedHeight: height, optimizeForLatency: true };
+}
+
+async function createWorkerRenderer(onFrame, onReset, onError) {
+  if (!workerAvailable || !canvas.transferControlToOffscreen || !globalThis.Worker) return;
+  const targetCanvas = canvas;
+  let worker;
+  try {
+    worker = new Worker('/decoder-worker.js');
+  } catch {
+    workerAvailable = false;
+    return;
+  }
+  const supported = await new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), 2000);
+    worker.onmessage = ({ data }) => {
+      if (data.type !== 'ready') return;
+      clearTimeout(timeout);
+      resolve(data.supported);
+    };
+    worker.onerror = () => {
+      clearTimeout(timeout);
+      resolve(false);
+    };
+  });
+  if (!supported || targetCanvas !== canvas) {
+    worker.terminate();
+    return;
+  }
+  let offscreen;
+  try {
+    offscreen = targetCanvas.transferControlToOffscreen();
+  } catch {
+    worker.terminate();
+    return;
+  }
+  worker.onerror = (error) => onError(error.message || '独立渲染线程异常');
+  worker.onmessage = ({ data }) => {
+    if (data.type === 'frame') onFrame(data);
+    if (data.type === 'reset') onReset();
+    if (data.type === 'error') onError(data.message);
+  };
+  worker.postMessage({ type: 'init', canvas: offscreen }, [offscreen]);
+  return {
+    configure(config) { worker.postMessage({ type: 'configure', config }); },
+    decode(bytes, timestamp, keyframe, encodedAt) {
+      const data = bytes.slice().buffer;
+      worker.postMessage({ type: 'decode', data, timestamp, keyframe, encodedAt }, [data]);
+    },
+    resize(width, height) { worker.postMessage({ type: 'resize', width, height }); },
+    reset() { worker.postMessage({ type: 'reset' }); },
+    close() { worker.terminate(); },
+  };
 }
 
 function screenPixels() {
@@ -182,38 +257,87 @@ async function showStream(mode, lowLatency, playbackSignal) {
   let needKeyframe = true;
   let wakeLock;
   let firstFrameTimer;
+  let workerRenderer;
+  let workerFailed = false;
+  const decodeStarted = new Map();
+  let pendingDecodeMs = 0;
+  let pendingDecodedAt = 0;
 
   function closeDecoder() {
     if (decoder && decoder.state !== 'closed') decoder.close();
     decoder = undefined;
+    decodeStarted.clear();
+    workerRenderer?.reset();
+  }
+
+  function framePresented(encodedAt, decodeMs, renderMs, renderedAt, worker = false) {
+    measureFrame(encodedAt, decodeMs, renderMs, renderedAt, worker);
+    if (!status.hidden) {
+      clearTimeout(firstFrameTimer);
+      showStatus('');
+      resolution.textContent = `USB · ${width}×${height}`;
+      resolution.hidden = false;
+      wakeLock ??= navigator.wakeLock?.request('screen').catch(() => undefined);
+    }
+  }
+
+  function present(frame, decodeMs, decodedAt) {
+    try {
+      if (signal.aborted) return;
+      context.drawImage(frame, 0, 0, width, height);
+      framePresented(Number(firstTimestamp) / 1e6 + frame.timestamp / 1000, decodeMs, performance.now() - decodedAt);
+    } finally {
+      frame.close();
+    }
   }
 
   function draw(frame) {
+    const decodedAt = performance.now();
+    const started = decodeStarted.get(frame.timestamp) ?? decodedAt;
+    decodeStarted.delete(frame.timestamp);
+    if (lowLatency) {
+      present(frame, decodedAt - started, decodedAt);
+      return;
+    }
     pendingFrame?.close();
     pendingFrame = frame;
+    pendingDecodeMs = decodedAt - started;
+    pendingDecodedAt = decodedAt;
     if (drawRequest !== undefined) return;
     drawRequest = requestAnimationFrame(() => {
       const latest = pendingFrame;
       pendingFrame = undefined;
       drawRequest = undefined;
-      try {
-        if (signal.aborted) return;
-        context.drawImage(latest, 0, 0, canvas.width, canvas.height);
-        measureFrame(Number(firstTimestamp) / 1e6 + latest.timestamp / 1000);
-        if (!status.hidden) {
-          clearTimeout(firstFrameTimer);
-          showStatus('');
-          resolution.textContent = `USB · ${canvas.width}×${canvas.height}`;
-          resolution.hidden = false;
-          wakeLock ??= navigator.wakeLock?.request('screen').catch(() => undefined);
-        }
-      } finally {
-        latest.close();
-      }
+      present(latest, pendingDecodeMs, pendingDecodedAt);
     });
   }
 
   try {
+    // A fresh canvas allows switching between main-thread and OffscreenCanvas rendering.
+    const replacement = canvas.cloneNode(false);
+    canvas.replaceWith(replacement);
+    canvas = replacement;
+    context = undefined;
+    if (lowLatency) {
+      workerRenderer = await createWorkerRenderer(
+        (frame) => {
+          if (signal.aborted || !measureFrame) return;
+          framePresented(frame.encodedAt, frame.decodeMs, frame.renderMs, frame.renderedAt - performance.timeOrigin, true);
+        },
+        () => { needKeyframe = true; },
+        (message) => {
+          workerAvailable = false;
+          workerFailed = true;
+          decoderError = new Error(message);
+          connection.abort();
+        },
+      );
+    }
+    if (!workerRenderer) {
+      context = canvas.getContext('2d', { alpha: false, desynchronized: true });
+      if (!context) throw new UnsupportedCodecError('浏览器无法创建画布。');
+    }
+    signal.throwIfAborted();
     const [screenWidth, screenHeight] = screenPixels();
     const params = new URLSearchParams({ w: screenWidth, h: screenHeight, codec: mode.codec });
     if (mode.compat) params.set('compat', '1');
@@ -252,8 +376,14 @@ async function showStream(mode, lowLatency, playbackSignal) {
         if (width !== newWidth || height !== newHeight) {
           width = newWidth;
           height = newHeight;
-          canvas.width = width;
-          canvas.height = height;
+          canvas.dataset.width = String(width);
+          canvas.dataset.height = String(height);
+          if (workerRenderer) {
+            workerRenderer.resize(width, height);
+          } else {
+            canvas.width = width;
+            canvas.height = height;
+          }
           showStatus('正在调整画面…');
           clearTimeout(firstFrameTimer);
           firstFrameTimer = undefined;
@@ -284,14 +414,18 @@ async function showStream(mode, lowLatency, playbackSignal) {
         const { supported } = await VideoDecoder.isConfigSupported(config);
         signal.throwIfAborted();
         if (!supported) throw new UnsupportedCodecError('平板浏览器无法解码这档画质。');
-        decoder = new VideoDecoder({
-          output: draw,
-          error: (error) => {
-            decoderError = error;
-            connection.abort();
-          },
-        });
-        decoder.configure(config);
+        if (workerRenderer) {
+          workerRenderer.configure(config);
+        } else {
+          decoder = new VideoDecoder({
+            output: draw,
+            error: (error) => {
+              decoderError = error;
+              connection.abort();
+            },
+          });
+          decoder.configure(config);
+        }
         needKeyframe = false;
         if (!firstFrameTimer && !status.hidden) {
           firstFrameTimer = setTimeout(() => {
@@ -303,17 +437,24 @@ async function showStream(mode, lowLatency, playbackSignal) {
 
       firstTimestamp ??= captureTime;
       lastTimestamp = Math.max(lastTimestamp + 1, Number((captureTime - firstTimestamp) / 1000n));
-      decoder.decode(new EncodedVideoChunk({
-        type: keyframe ? 'key' : 'delta', timestamp: lastTimestamp, data: bytes,
-      }));
+      if (workerRenderer) {
+        workerRenderer.decode(bytes, lastTimestamp, keyframe, Number(captureTime) / 1e6);
+      } else {
+        decodeStarted.set(lastTimestamp, performance.now());
+        decoder.decode(new EncodedVideoChunk({
+          type: keyframe ? 'key' : 'delta', timestamp: lastTimestamp, data: bytes,
+        }));
+      }
     }
   } catch (error) {
+    if (workerFailed) throw new Error(`正在切换兼容渲染。${decoderError.message}`);
     if (decoderError) throw new UnsupportedCodecError(`平板视频解码中断。${decoderError.message}`);
     throw error;
   } finally {
     clearTimeout(firstFrameTimer);
     connection.abort();
     closeDecoder();
+    workerRenderer?.close();
     if (drawRequest !== undefined) cancelAnimationFrame(drawRequest);
     pendingFrame?.close();
     wakeLock?.then((lock) => lock?.release()).catch(() => {});
@@ -327,7 +468,8 @@ async function run(signal, lowLatency) {
     { codec: 'avc', compat: false },
     { codec: 'avc', compat: true },
   ];
-  if (await prefersHevc(width, height)) modes.unshift({ codec: 'hevc', compat: false });
+  const requestedCodec = new URLSearchParams(location.search).get('codec');
+  if (requestedCodec !== 'avc' && await prefersHevc(width, height)) modes.unshift({ codec: 'hevc', compat: false });
   let currentMode = 0;
   while (!signal.aborted) {
     try {
@@ -355,11 +497,15 @@ function restartPlayback() {
   run(playback.signal, lowLatency);
 }
 
-if (!globalThis.VideoDecoder || !context) {
+if (!globalThis.VideoDecoder) {
   latencyButton.hidden = true;
   showStatus('此浏览器缺少实时视频解码功能，请使用鸿蒙系统浏览器打开。');
 } else {
-  try { lowLatency = localStorage.getItem('sidescreen-low-latency') === '1'; } catch {}
+  try {
+    const requested = new URLSearchParams(location.search).get('latency');
+    lowLatency = requested === null ? localStorage.getItem('sidescreen-low-latency') === '1' : requested === 'low';
+    if (requested !== null) localStorage.setItem('sidescreen-low-latency', lowLatency ? '1' : '0');
+  } catch {}
   latencyButton.setAttribute('aria-pressed', String(lowLatency));
   latencyButton.addEventListener('click', () => {
     lowLatency = !lowLatency;
