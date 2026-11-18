@@ -164,6 +164,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let granted = CGPreflightScreenCaptureAccess()
             let justGranted = granted && !settings.hasScreenRecordingPermission
             settings.hasScreenRecordingPermission = granted
+            let canControl = AXIsProcessTrusted()
+            if settings.hasAccessibilityPermission != canControl {
+                settings.hasAccessibilityPermission = canControl
+            }
             settings.usbDeviceConnected = harmonyBridge.usbConnected
             if justGranted {
                 Task { await self.startServer() }
@@ -294,6 +298,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .sink { [weak self] enabled in
                 self?.streamingServer?.touchEnabled = enabled
+                if !enabled { self?.cancelTouchGesture() }
             }
             .store(in: &cancellables)
 
@@ -666,6 +671,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
                 Task { @MainActor in
+                    self.cancelTouchGesture()
                     self.settings.clientConnected = true
                 }
             }
@@ -694,6 +700,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.onClientDisconnected = { [weak self] in
                 guard let self = self else { return }
                 Task { @MainActor in
+                    self.cancelTouchGesture()
                     self.settings.clientConnected = false
                     self.closeActiveProfile()
                     // Final lastConnected snapshot at the disconnect moment, then
@@ -969,6 +976,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func tearDownServerResources(saveDisplayPosition: Bool) {
+        cancelTouchGesture()
         if saveDisplayPosition {
             virtualDisplayManager?.saveDisplayPosition()
         }
@@ -1037,7 +1045,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Touch Entry Point
 
+    private func cancelTouchGesture() {
+        cancelLongPressTimer()
+        stopMomentumScroll()
+        if gestureState == .dragging { injectMouseUp(at: touchLastPosition) }
+        gestureState = .idle
+        lastTapTime = 0
+    }
+
     func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
+        if action == 3 {
+            cancelTouchGesture()
+            return
+        }
         guard settings.touchEnabled else { return }
 
         if !AXIsProcessTrusted() {
@@ -1053,20 +1073,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let displayID = virtualDisplayManager?.displayID else { return }
         let bounds = CGDisplayBounds(displayID)
-
-        let p1 = CGPoint(
-            x: bounds.origin.x + CGFloat(x) * bounds.width,
-            y: bounds.origin.y + CGFloat(y) * bounds.height
-        )
-        let p2 = CGPoint(
-            x: bounds.origin.x + CGFloat(x2) * bounds.width,
-            y: bounds.origin.y + CGFloat(y2) * bounds.height
-        )
+        guard bounds.width >= 1, bounds.height >= 1, x.isFinite, y.isFinite, x2.isFinite, y2.isFinite else { return }
+        func desktopPoint(_ x: Float, _ y: Float) -> CGPoint {
+            // A gesture ending at the far edge must stay on this display.
+            CGPoint(x: bounds.minX + min(bounds.width - 1, max(0, CGFloat(x) * bounds.width)),
+                    y: bounds.minY + min(bounds.height - 1, max(0, CGFloat(y) * bounds.height)))
+        }
 
         if pointerCount >= 2 {
-            handleTwoFingerTouch(p1: p1, p2: p2, action: action)
+            handleTwoFingerTouch(p1: desktopPoint(x, y), p2: desktopPoint(x2, y2), action: action)
         } else {
-            handleOneFingerTouch(at: p1, action: action)
+            handleOneFingerTouch(at: desktopPoint(x, y), action: action)
         }
     }
 
@@ -1217,9 +1234,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch action {
         case 0: // Down
-            cancelLongPressTimer()
-            stopMomentumScroll()
-            gestureState = .idle  // Reset so 2-finger detection starts fresh
+            cancelTouchGesture()
             initialPinchDistance = distance
             lastPinchDistance = distance
             touchLastPosition = midpoint

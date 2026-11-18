@@ -13,6 +13,7 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -24,6 +25,29 @@ LOOPBACK = "127.0.0.1"
 DEFAULT_MAC_PORT = 54321
 DEFAULT_VIEWER_PORT = 54323
 MAC_APP = HERE.parent / "MacHost/.build/SideScreen Harmony.app"
+VIEWER_SCRIPTS = ("viewer.js", "decoder-worker.js", "touch.mjs")
+MAX_TOUCH_BYTES = 16 * 22  # At most 16 two-finger SideScreen messages per request.
+
+
+def valid_touch_batch(data):
+    offset = 0
+    count = 0
+    while offset < len(data):
+        if count >= 16 or len(data) - offset < 2 or data[offset] != 2:
+            return False
+        fingers = data[offset + 1]
+        if fingers not in (1, 2):
+            return False
+        size = 2 + fingers * 8 + 4
+        if len(data) - offset < size:
+            return False
+        coords = struct.unpack_from("<" + "ff" * fingers, data, offset + 2)
+        action = struct.unpack_from("<i", data, offset + size - 4)[0]
+        if not all(0 <= value <= 1 for value in coords) or action not in (0, 1, 2, 3):
+            return False
+        offset += size
+        count += 1
+    return count > 0
 
 
 def pixel_size(width, height):
@@ -156,7 +180,7 @@ class UsbTunnel:
         return None
 
     def open_viewer(self, target):
-        assets = b"".join((HERE / name).read_bytes() for name in ("index.html", "viewer.js", "decoder-worker.js"))
+        assets = b"".join((HERE / name).read_bytes() for name in ("index.html", *VIEWER_SCRIPTS))
         version = hashlib.sha256(assets).hexdigest()[:12]
         separator = "&" if "?" in self.url else "?"
         url = f"{self.url}{separator}v={version}"
@@ -180,6 +204,7 @@ class ViewerServer(ThreadingHTTPServer):
         super().__init__((LOOPBACK, viewer_port), ViewerHandler)
         self.source_port = source_port
         self.stream_lock = threading.Lock()
+        self.control_lock = threading.Lock()
         self.active_stream = None
         self.usb_ready = threading.Event()
         self.panel_size = None
@@ -201,18 +226,44 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.is_local_request():
             return
-        if self.path != "/keyframe":
+        if self.path not in ("/touch", "/keyframe"):
             self.send_error(404)
             return
-        if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Length", "0") != "0":
+        origin = self.headers.get("Origin")
+        if origin and origin != f"http://{LOOPBACK}:{self.server.server_port}":
+            self.send_error(403)
+            return
+        length = self.headers.get("Content-Length", "0")
+        if self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9]{1,3}", length):
             self.close_connection = True
             self.send_error(400)
             return
-        token, keyframe_requested = self.server.active_stream or (None, None)
-        if keyframe_requested is None or self.headers.get("X-SideScreen-Stream") != token:
-            self.send_error(409, "Stream has changed")
+        length = int(length)
+        if self.path == "/touch":
+            if not 0 < length <= MAX_TOUCH_BYTES or self.headers.get_content_type() != "application/octet-stream":
+                self.close_connection = True
+                self.send_error(400)
+                return
+            data = self.rfile.read(length)
+            if len(data) != length or not valid_touch_batch(data):
+                self.send_error(400, "Invalid touch events")
+                return
+        elif length == 0:
+            data = bytes((7, 0))  # SideScreen's throttled keyframe request.
+        else:
+            self.close_connection = True
+            self.send_error(400)
             return
-        keyframe_requested.set()
+        with self.server.control_lock:
+            token, source = self.server.active_stream or (None, None)
+            if source is None or self.headers.get("X-SideScreen-Stream") != token:
+                self.send_error(409, "Stream has changed")
+                return
+            try:
+                source.sendall(data)
+            except OSError:
+                self.send_error(503, "Stream disconnected")
+                return
         self.send_response(204)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -238,7 +289,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif path.path == "/":
             self.serve_page()
-        elif path.path in ("/viewer.js", "/decoder-worker.js"):
+        elif path.path[1:] in VIEWER_SCRIPTS:
             self.serve_file(path.path[1:], "text/javascript; charset=utf-8")
         elif self.path == "/favicon.ico":
             self.send_response(204)
@@ -257,6 +308,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if stream_token is not None:
             self.send_header("X-SideScreen-Transport", "usb")
             self.send_header("X-SideScreen-Stream", stream_token)
+            self.send_header("X-SideScreen-Input", "touch")
             self.send_header("Connection", "close")
         self.end_headers()
 
@@ -312,14 +364,11 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 source.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 source.sendall(hello)
                 token = secrets.token_hex(12)
-                keyframe_requested = threading.Event()
-                self.server.active_stream = (token, keyframe_requested)
+                with self.server.control_lock:
+                    self.server.active_stream = (token, source)
                 self.server.viewer_metrics = {}
                 self.headers_for("application/octet-stream", stream_token=token)
                 while self.server.usb_ready.is_set():
-                    if keyframe_requested.is_set():
-                        keyframe_requested.clear()
-                        source.sendall(bytes((7, 0)))  # SideScreen's throttled keyframe request.
                     ready, _, _ = select.select([source, self.connection], [], [], 0.25)
                     if self.connection in ready:
                         return
@@ -332,7 +381,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
         finally:
-            self.server.active_stream = None
+            with self.server.control_lock:
+                self.server.active_stream = None
             self.server.stream_lock.release()
 
     def log_message(self, _format, *_args):

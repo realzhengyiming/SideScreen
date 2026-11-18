@@ -54,6 +54,18 @@ struct HarmonySettingsView: View {
                 if let mode = settings.tabletDisplayMode {
                     LabeledContent("平板分辨率", value: "\(mode.width) × \(mode.height) · 60 Hz")
                 }
+                Toggle("平板触控", isOn: $settings.touchEnabled)
+                    .toggleStyle(.switch)
+                if settings.touchEnabled && !settings.hasAccessibilityPermission {
+                    HStack {
+                        Text("允许辅助功能后，平板可点击和拖动 Mac 窗口。")
+                            .font(.caption).foregroundColor(.secondary)
+                        Spacer()
+                        Button("打开辅助功能设置") {
+                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                        }
+                    }
+                }
             }
             VStack(alignment: .leading, spacing: 5) {
                 Text("平板浏览器地址").foregroundColor(.secondary)
@@ -78,14 +90,14 @@ struct HarmonySettingsView: View {
             }
         }
         .padding(26)
-        .frame(width: 470, height: 440)
+        .frame(width: 470, height: 495)
     }
 }
 
 extension SettingsWindowController {
     convenience init(settings: DisplaySettings, bridge: HarmonyBridgeController, reconnect: @escaping () -> Void) {
         let window = ConstrainedWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 470, height: 440),
+            contentRect: NSRect(x: 0, y: 0, width: 470, height: 495),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false

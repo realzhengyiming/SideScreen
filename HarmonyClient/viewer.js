@@ -420,6 +420,14 @@ async function showStream(mode, lowLatency, playbackSignal) {
       throw new Error('请重新运行 Mac 上的「打开鸿蒙副屏.command」。');
     }
     streamToken = response.headers.get('X-SideScreen-Stream');
+    if (streamToken && response.headers.get('X-SideScreen-Input') === 'touch') {
+      import('/touch.mjs').then(({ bindTabletTouch }) => {
+        if (!signal.aborted) {
+          bindTabletTouch(replacement, streamToken, signal,
+            () => status.hidden ? { flipX, flipY } : undefined, () => connection.abort());
+        }
+      }).catch(console.warn);
+    }
     const recoverSlowRenderer = lowLatency ? () => stalled('平板持续收到视频帧，画面刷新过慢') : undefined;
     monitor = monitorStream(signal, recoverSlowRenderer);
     const stream = new StreamReader(response.body);
