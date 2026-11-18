@@ -57,7 +57,6 @@ function codecFromKeyframe(bytes) {
 
 const stage = document.querySelector('main');
 let canvas = document.querySelector('canvas');
-let context;
 let workerAvailable = true;
 const status = document.getElementById('status');
 const fullscreen = document.getElementById('fullscreen');
@@ -93,17 +92,39 @@ function resetMetrics() {
   pingValue.textContent = '—';
 }
 
-function monitorStream(signal) {
+function monitorStream(signal, onSlowRenderer) {
   const recentPings = [];
   const metrics = {};
   let clockOffset;
   let delayAverage;
   let lastUpdate = -Infinity;
+  let sampleAt = performance.now();
+  let receivedCount = 0;
+  let drawnCount = 0;
+  let lastPacketAt = -Infinity;
+  let lastDrawAt;
+  let pendingSince;
+  let pendingPackets = 0;
+  let slowSamples = 0;
 
   async function measurePing() {
     while (!signal.aborted) {
       const start = performance.now();
       try {
+        if (start > sampleAt) {
+          metrics.receivedFps = Math.round(receivedCount * 1000 / (start - sampleAt));
+          metrics.drawnFps = Math.round(drawnCount * 1000 / (start - sampleAt));
+          const fallingBehind = lastDrawAt !== undefined && metrics.receivedFps >= 20
+            && metrics.drawnFps < metrics.receivedFps / 3;
+          slowSamples = fallingBehind ? slowSamples + 1 : 0;
+          if (slowSamples >= 3 && onSlowRenderer) {
+            onSlowRenderer();
+            return;
+          }
+        }
+        if (lastDrawAt !== undefined) metrics.lastDrawAgeMs = Math.min(60000, Math.round(start - lastDrawAt));
+        sampleAt = start;
+        receivedCount = drawnCount = 0;
         const query = new URLSearchParams({ ...metrics, sample: String(start) });
         const url = new URL(`/ping?${query}`, location.href);
         const response = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(2500)]) });
@@ -146,8 +167,24 @@ function monitorStream(signal) {
     }
   }
 
-  measurePing();
-  return (encodedAt, decodeMs, renderMs, renderedAt = performance.now(), worker = false) => {
+  function received() {
+    const now = performance.now();
+    receivedCount++;
+    // Only count a stall while new video packets keep arriving. A static Mac desktop can be quiet.
+    if (pendingSince === undefined || now - lastPacketAt > 1500) {
+      pendingSince = now;
+      pendingPackets = 0;
+    }
+    lastPacketAt = now;
+    pendingPackets++;
+    return pendingPackets >= 6 && now - pendingSince >= (lastDrawAt === undefined ? 7000 : 1500);
+  }
+
+  function presented(encodedAt, decodeMs, renderMs, renderedAt = performance.now(), worker = false) {
+    drawnCount++;
+    lastDrawAt = performance.now();
+    pendingSince = undefined;
+    metrics.worker = Number(worker);
     if (clockOffset === undefined) return;
     const now = renderedAt;
     const delay = Math.max(0, now + clockOffset - encodedAt);
@@ -155,12 +192,13 @@ function monitorStream(signal) {
     metrics.frameMs = delayAverage;
     metrics.decodeMs = decodeMs;
     metrics.renderMs = renderMs;
-    metrics.worker = Number(worker);
     if (now - lastUpdate >= 500) {
       frameDelayValue.textContent = `≈ ${Math.round(delayAverage)} ms`;
       lastUpdate = now;
     }
-  };
+  }
+  measurePing();
+  return { received, presented };
 }
 
 fullscreen.hidden = !stage.requestFullscreen || !document.fullscreenEnabled;
@@ -168,12 +206,14 @@ fullscreen.addEventListener('click', () => stage.requestFullscreen().catch(conso
 new ResizeObserver(fitCanvas).observe(stage);
 
 class UnsupportedCodecError extends Error {}
+class RetryRendererError extends Error {}
+class StalledDecoderError extends Error {}
 
 function decoderConfig(codec, width, height) {
   return { codec, codedWidth: width, codedHeight: height, optimizeForLatency: true };
 }
 
-async function createWorkerRenderer(onFrame, onReset, onError) {
+async function createWorkerRenderer(onFrame, requestKeyframe, onError) {
   if (!workerAvailable || !canvas.transferControlToOffscreen || !globalThis.Worker) return;
   const targetCanvas = canvas;
   let worker;
@@ -209,7 +249,7 @@ async function createWorkerRenderer(onFrame, onReset, onError) {
   worker.onerror = (error) => onError(error.message || '独立渲染线程异常');
   worker.onmessage = ({ data }) => {
     if (data.type === 'frame') onFrame(data);
-    if (data.type === 'reset') onReset();
+    if (data.type === 'needKeyframe') requestKeyframe();
     if (data.type === 'error') onError(data.message);
   };
   worker.postMessage({ type: 'init', canvas: offscreen }, [offscreen]);
@@ -243,12 +283,13 @@ async function prefersHevc(width, height) {
 async function showStream(mode, lowLatency, playbackSignal) {
   const connection = new AbortController();
   const signal = AbortSignal.any([connection.signal, playbackSignal]);
-  const maxDecodeQueue = lowLatency ? 3 : 8;
+  const maxDecodeQueue = lowLatency ? 6 : 8;
+  let context;
   let decoder;
   let decoderError;
   let pendingFrame;
   let drawRequest;
-  let measureFrame;
+  let monitor;
   let avc = false;
   let width = 0;
   let height = 0;
@@ -259,6 +300,8 @@ async function showStream(mode, lowLatency, playbackSignal) {
   let firstFrameTimer;
   let workerRenderer;
   let workerFailed = false;
+  let streamToken;
+  let lastKeyframeRequest = -Infinity;
   const decodeStarted = new Map();
   let pendingDecodeMs = 0;
   let pendingDecodedAt = 0;
@@ -270,8 +313,35 @@ async function showStream(mode, lowLatency, playbackSignal) {
     workerRenderer?.reset();
   }
 
+  function requestKeyframe() {
+    const now = performance.now();
+    if (!streamToken || signal.aborted || now - lastKeyframeRequest < 500) return;
+    lastKeyframeRequest = now;
+    fetch('/keyframe', {
+      method: 'POST', headers: { 'X-SideScreen-Stream': streamToken },
+      signal: AbortSignal.any([signal, AbortSignal.timeout(1500)]),
+    }).catch(() => {}); // Older bridges still deliver periodic keyframes.
+  }
+
+  function failWorker(message) {
+    if (signal.aborted) return;
+    workerAvailable = false;
+    workerFailed = true;
+    decoderError = new Error(message);
+    connection.abort();
+  }
+
+  function stalled(message) {
+    if (workerRenderer) {
+      failWorker(message);
+    } else {
+      decoderError = new StalledDecoderError(message);
+      connection.abort();
+    }
+  }
+
   function framePresented(encodedAt, decodeMs, renderMs, renderedAt, worker = false) {
-    measureFrame(encodedAt, decodeMs, renderMs, renderedAt, worker);
+    monitor.presented(encodedAt, decodeMs, renderMs, renderedAt, worker);
     if (!status.hidden) {
       clearTimeout(firstFrameTimer);
       showStatus('');
@@ -292,9 +362,15 @@ async function showStream(mode, lowLatency, playbackSignal) {
   }
 
   function draw(frame) {
+    if (signal.aborted) {
+      frame.close();
+      return;
+    }
     const decodedAt = performance.now();
     const started = decodeStarted.get(frame.timestamp) ?? decodedAt;
     decodeStarted.delete(frame.timestamp);
+    if (needKeyframe && decoder && decoder.decodeQueueSize < maxDecodeQueue
+        && decodeStarted.size < 2 * maxDecodeQueue) requestKeyframe();
     if (lowLatency) {
       present(frame, decodedAt - started, decodedAt);
       return;
@@ -317,27 +393,20 @@ async function showStream(mode, lowLatency, playbackSignal) {
     const replacement = canvas.cloneNode(false);
     canvas.replaceWith(replacement);
     canvas = replacement;
-    context = undefined;
     if (lowLatency) {
       workerRenderer = await createWorkerRenderer(
         (frame) => {
-          if (signal.aborted || !measureFrame) return;
+          if (signal.aborted || !monitor) return;
           framePresented(frame.encodedAt, frame.decodeMs, frame.renderMs, frame.renderedAt - performance.timeOrigin, true);
         },
-        () => { needKeyframe = true; },
-        (message) => {
-          workerAvailable = false;
-          workerFailed = true;
-          decoderError = new Error(message);
-          connection.abort();
-        },
+        requestKeyframe, failWorker,
       );
     }
+    signal.throwIfAborted();
     if (!workerRenderer) {
-      context = canvas.getContext('2d', { alpha: false, desynchronized: true });
+      context = replacement.getContext('2d', { alpha: false, desynchronized: true });
       if (!context) throw new UnsupportedCodecError('浏览器无法创建画布。');
     }
-    signal.throwIfAborted();
     const [screenWidth, screenHeight] = screenPixels();
     const params = new URLSearchParams({ w: screenWidth, h: screenHeight, codec: mode.codec });
     if (mode.compat) params.set('compat', '1');
@@ -350,7 +419,9 @@ async function showStream(mode, lowLatency, playbackSignal) {
     if (response.headers.get('X-SideScreen-Transport') !== 'usb') {
       throw new Error('请重新运行 Mac 上的「打开鸿蒙副屏.command」。');
     }
-    measureFrame = monitorStream(signal);
+    streamToken = response.headers.get('X-SideScreen-Stream');
+    const recoverSlowRenderer = lowLatency ? () => stalled('平板持续收到视频帧，画面刷新过慢') : undefined;
+    monitor = monitorStream(signal, recoverSlowRenderer);
     const stream = new StreamReader(response.body);
     showStatus('已连接，等待 Mac 画面…');
 
@@ -404,34 +475,40 @@ async function showStream(mode, lowLatency, playbackSignal) {
       const captureTime = header.getBigUint64(5);
       const bytes = await stream.read(length);
 
-      if (decoder && decoder.decodeQueueSize >= maxDecodeQueue) {
-        closeDecoder();
+      if (monitor.received() && lowLatency) {
+        stalled('持续收到视频帧，但画面停止更新');
+        signal.throwIfAborted();
+      }
+      if (decoder && (decoder.decodeQueueSize >= maxDecodeQueue || decodeStarted.size >= 2 * maxDecodeQueue)) {
         needKeyframe = true;
+        continue;
       }
       if (needKeyframe) {
-        if (!keyframe) continue;
-        const config = decoderConfig(avc ? codecFromKeyframe(bytes) : HEVC_MAIN, width, height);
-        const { supported } = await VideoDecoder.isConfigSupported(config);
-        signal.throwIfAborted();
-        if (!supported) throw new UnsupportedCodecError('平板浏览器无法解码这档画质。');
-        if (workerRenderer) {
-          workerRenderer.configure(config);
-        } else {
-          decoder = new VideoDecoder({
-            output: draw,
-            error: (error) => {
-              decoderError = error;
-              connection.abort();
-            },
-          });
-          decoder.configure(config);
+        if (!keyframe) {
+          requestKeyframe();
+          continue;
+        }
+        if (!decoder) {
+          const config = decoderConfig(avc ? codecFromKeyframe(bytes) : HEVC_MAIN, width, height);
+          const { supported } = await VideoDecoder.isConfigSupported(config);
+          signal.throwIfAborted();
+          if (!supported) throw new UnsupportedCodecError('平板浏览器无法解码这档画质。');
+          if (workerRenderer) {
+            workerRenderer.configure(config);
+          } else {
+            decoder = new VideoDecoder({
+              output: draw,
+              error: (error) => {
+                decoderError = error;
+                connection.abort();
+              },
+            });
+            decoder.configure(config);
+          }
         }
         needKeyframe = false;
         if (!firstFrameTimer && !status.hidden) {
-          firstFrameTimer = setTimeout(() => {
-            decoderError = new Error('等待首帧超时');
-            connection.abort();
-          }, 7000);
+          firstFrameTimer = setTimeout(() => stalled('等待首帧超时'), 7000);
         }
       }
 
@@ -447,7 +524,8 @@ async function showStream(mode, lowLatency, playbackSignal) {
       }
     }
   } catch (error) {
-    if (workerFailed) throw new Error(`正在切换兼容渲染。${decoderError.message}`);
+    if (workerFailed) throw new RetryRendererError(`正在恢复低延迟画面。${decoderError.message}`);
+    if (decoderError instanceof StalledDecoderError) throw decoderError;
     if (decoderError) throw new UnsupportedCodecError(`平板视频解码中断。${decoderError.message}`);
     throw error;
   } finally {
@@ -476,6 +554,15 @@ async function run(signal, lowLatency) {
       await showStream(modes[currentMode], lowLatency, signal);
     } catch (error) {
       if (signal.aborted) return;
+      if (error instanceof RetryRendererError) {
+        showStatus(error.message);
+        continue;
+      }
+      if (error instanceof StalledDecoderError) {
+        currentMode = Math.min(currentMode + 1, modes.length - 1);
+        showStatus('正在恢复副屏画面…');
+        continue;
+      }
       if (error instanceof UnsupportedCodecError && currentMode + 1 < modes.length) {
         currentMode += 1;
         showStatus('正在切换到兼容画质…');

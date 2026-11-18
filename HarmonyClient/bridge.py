@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -179,6 +180,7 @@ class ViewerServer(ThreadingHTTPServer):
         super().__init__((LOOPBACK, viewer_port), ViewerHandler)
         self.source_port = source_port
         self.stream_lock = threading.Lock()
+        self.active_stream = None
         self.usb_ready = threading.Event()
         self.panel_size = None
         self.viewer_metrics = {}
@@ -189,11 +191,35 @@ class ViewerHandler(BaseHTTPRequestHandler):
     timeout = 5
     disable_nagle_algorithm = True
 
-    def do_GET(self):
-        received_us = time.monotonic_ns() // 1000
+    def is_local_request(self):
         expected_host = f"{LOOPBACK}:{self.server.server_port}"
         if self.headers.get("Host") != expected_host or self.headers.get("Sec-Fetch-Site") == "cross-site":
             self.send_error(403)
+            return False
+        return True
+
+    def do_POST(self):
+        if not self.is_local_request():
+            return
+        if self.path != "/keyframe":
+            self.send_error(404)
+            return
+        if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Length", "0") != "0":
+            self.close_connection = True
+            self.send_error(400)
+            return
+        token, keyframe_requested = self.server.active_stream or (None, None)
+        if keyframe_requested is None or self.headers.get("X-SideScreen-Stream") != token:
+            self.send_error(409, "Stream has changed")
+            return
+        keyframe_requested.set()
+        self.send_response(204)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_GET(self):
+        received_us = time.monotonic_ns() // 1000
+        if not self.is_local_request():
             return
         path = urlsplit(self.path)
         if path.path == "/stream":
@@ -220,7 +246,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def headers_for(self, content_type, length=None, usb_stream=False):
+    def headers_for(self, content_type, length=None, stream_token=None):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
@@ -228,8 +254,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'")
         if length is not None:
             self.send_header("Content-Length", str(length))
-        if usb_stream:
+        if stream_token is not None:
             self.send_header("X-SideScreen-Transport", "usb")
+            self.send_header("X-SideScreen-Stream", stream_token)
             self.send_header("Connection", "close")
         self.end_headers()
 
@@ -239,7 +266,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
             return
         values = parse_qs(query)
         metrics = {}
-        for name in ("frameMs", "decodeMs", "renderMs", "fetchMs", "httpMs", "requestQueueMs", "scheduleMs", "worker"):
+        for name in ("frameMs", "decodeMs", "renderMs", "fetchMs", "httpMs", "requestQueueMs", "scheduleMs",
+                     "worker", "receivedFps", "drawnFps", "lastDrawAgeMs"):
             try:
                 value = float(values[name][0])
             except (KeyError, ValueError):
@@ -283,9 +311,16 @@ class ViewerHandler(BaseHTTPRequestHandler):
             with source:
                 source.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 source.sendall(hello)
-                self.headers_for("application/octet-stream", usb_stream=True)
+                token = secrets.token_hex(12)
+                keyframe_requested = threading.Event()
+                self.server.active_stream = (token, keyframe_requested)
+                self.server.viewer_metrics = {}
+                self.headers_for("application/octet-stream", stream_token=token)
                 while self.server.usb_ready.is_set():
-                    ready, _, _ = select.select([source, self.connection], [], [], 1)
+                    if keyframe_requested.is_set():
+                        keyframe_requested.clear()
+                        source.sendall(bytes((7, 0)))  # SideScreen's throttled keyframe request.
+                    ready, _, _ = select.select([source, self.connection], [], [], 0.25)
                     if self.connection in ready:
                         return
                     if source not in ready:
@@ -297,6 +332,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
         finally:
+            self.server.active_stream = None
             self.server.stream_lock.release()
 
     def log_message(self, _format, *_args):

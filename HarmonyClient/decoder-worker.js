@@ -2,12 +2,27 @@ let canvas;
 let context;
 let decoder;
 let generation = 0;
+let waitingForKeyframe = false;
+let recoveryRequested = false;
 const frames = new Map();
+
+function queueFull() {
+  return decoder.decodeQueueSize >= 6 || frames.size >= 12;
+}
+
+function requestRecoveryFrame() {
+  if (waitingForKeyframe && !recoveryRequested && !queueFull()) {
+    recoveryRequested = true;
+    self.postMessage({ type: 'needKeyframe' });
+  }
+}
 
 function resetDecoder() {
   generation += 1;
   if (decoder && decoder.state !== 'closed') decoder.close();
   decoder = undefined;
+  waitingForKeyframe = false;
+  recoveryRequested = false;
   frames.clear();
 }
 
@@ -22,7 +37,6 @@ function configure(config) {
         frames.delete(frame.timestamp);
         if (!metadata) return;
         const decodedAt = performance.now();
-        if (decodedAt - metadata.started > 100) return;
         context.drawImage(frame, 0, 0, canvas.width, canvas.height);
         const renderedAt = performance.now();
         self.postMessage({
@@ -32,11 +46,14 @@ function configure(config) {
           renderMs: renderedAt - decodedAt,
           renderedAt: performance.timeOrigin + renderedAt,
         });
+        requestRecoveryFrame();
       } finally {
         frame.close();
       }
     },
-    error(error) { self.postMessage({ type: 'error', message: error.message }); },
+    error(error) {
+      if (generation === activeGeneration) self.postMessage({ type: 'error', message: error.message });
+    },
   });
   decoder.configure(config);
 }
@@ -59,11 +76,19 @@ self.onmessage = ({ data }) => {
         break;
       case 'decode':
         if (!decoder || decoder.state !== 'configured') break;
-        if (decoder.decodeQueueSize >= 3 || frames.size >= 6) {
-          resetDecoder();
-          self.postMessage({ type: 'reset' });
+        if (queueFull()) {
+          waitingForKeyframe = true;
+          if (data.keyframe) recoveryRequested = false;
           break;
         }
+        // A keyframe restores the prediction chain. Keep the configured decoder and let
+        // its in-flight frames finish, including a slow first output.
+        if (waitingForKeyframe && !data.keyframe) {
+          requestRecoveryFrame();
+          break;
+        }
+        waitingForKeyframe = false;
+        recoveryRequested = false;
         frames.set(data.timestamp, { started: performance.now(), encodedAt: data.encodedAt });
         decoder.decode(new EncodedVideoChunk({
           type: data.keyframe ? 'key' : 'delta', timestamp: data.timestamp, data: data.data,
